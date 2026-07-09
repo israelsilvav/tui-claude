@@ -15,16 +15,18 @@ TEST_DIR = os.environ.get("TUI_CLAUDE_TEST_DIR")
 if TEST_DIR:
     PROFILES_DIR = os.path.join(TEST_DIR, "claude-profiles")
     CLAUDE_DIR = os.path.join(TEST_DIR, "claude")
+    CLAUDE_JSON = os.path.join(TEST_DIR, "claude.json")
 else:
     PROFILES_DIR = os.path.expanduser("~/.claude-profiles")
     CLAUDE_DIR = os.path.expanduser("~/.claude")
+    CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 
 # Global State
 state = {
     "profiles": [],
     "active_profile": None,
     "selected_index": 0,
-    "login_command": "claude login",
+    "login_command": "claude auth login",
     "message": "",
     "message_style": "info"
 }
@@ -70,6 +72,38 @@ def init_profiles():
             state["message"] = f"Initialization error: {e}"
             state["message_style"] = "error"
 
+    # ~/.claude.json holds the active account (oauthAccount, userID, etc.) but
+    # lives outside ~/.claude, so it must be migrated/symlinked per profile too,
+    # otherwise switching profiles keeps logging in as the same account.
+    active_profile_dir = None
+    if os.path.islink(CLAUDE_DIR):
+        try:
+            active_profile_dir = os.path.abspath(os.path.expanduser(os.readlink(CLAUDE_DIR)))
+        except Exception:
+            pass
+    if not active_profile_dir:
+        active_profile_dir = os.path.join(PROFILES_DIR, "default")
+
+    profile_json = os.path.join(active_profile_dir, "claude.json")
+    if os.path.lexists(CLAUDE_JSON):
+        if not os.path.islink(CLAUDE_JSON):
+            try:
+                if not os.path.lexists(profile_json):
+                    shutil.move(CLAUDE_JSON, profile_json)
+                else:
+                    backup_json = os.path.join(PROFILES_DIR, f"backup-existing-claude.json-{int(time.time())}")
+                    shutil.move(CLAUDE_JSON, backup_json)
+                os.symlink(profile_json, CLAUDE_JSON)
+            except Exception as e:
+                state["message"] = f"Failed to migrate ~/.claude.json: {e}"
+                state["message_style"] = "error"
+    else:
+        try:
+            os.symlink(profile_json, CLAUDE_JSON)
+        except Exception as e:
+            state["message"] = f"Initialization error (claude.json): {e}"
+            state["message_style"] = "error"
+
 def refresh_profiles():
     """Scan profiles and active state."""
     init_profiles()
@@ -113,6 +147,11 @@ def switch_profile(name):
         if os.path.lexists(CLAUDE_DIR):
             os.unlink(CLAUDE_DIR)
         os.symlink(profile_dir, CLAUDE_DIR)
+
+        if os.path.lexists(CLAUDE_JSON):
+            os.unlink(CLAUDE_JSON)
+        os.symlink(os.path.join(profile_dir, "claude.json"), CLAUDE_JSON)
+
         state["message"] = f"Switched to profile '{name}'."
         state["message_style"] = "success"
         return True
@@ -159,6 +198,8 @@ def delete_profile(name):
         if is_active:
             if os.path.lexists(CLAUDE_DIR):
                 os.unlink(CLAUDE_DIR)
+            if os.path.lexists(CLAUDE_JSON):
+                os.unlink(CLAUDE_JSON)
 
         shutil.rmtree(profile_dir)
         state["message"] = f"Deleted profile '{name}'."
@@ -346,6 +387,8 @@ def get_screen_text():
     tokens.append(("class:active", f"● {active}\n"))
     tokens.append(("", " Config location: "))
     tokens.append(("class:subtitle", f"{CLAUDE_DIR} -> {os.readlink(CLAUDE_DIR) if os.path.islink(CLAUDE_DIR) else 'Not a symlink'}\n"))
+    tokens.append(("", " Account cache: "))
+    tokens.append(("class:subtitle", f"{CLAUDE_JSON} -> {os.readlink(CLAUDE_JSON) if os.path.islink(CLAUDE_JSON) else 'Not a symlink'}\n"))
     tokens.append(("", f" Login command: {state['login_command']}\n"))
     tokens.append(("", "\n"))
 
