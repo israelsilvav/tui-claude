@@ -428,8 +428,11 @@ def enable_sharing(profiles_dir, profile):
                 os.makedirs(archive, exist_ok=True)
                 shutil.move(local, os.path.join(archive, name))
                 archived += 1
-        if os.path.exists(target):
-            os.symlink(target, local)
+        # Link even when neither side has the file yet: a symlink may point at
+        # a target that does not exist, and writing through it creates the
+        # target inside the pool. Without this, the first settings.json the app
+        # writes would land in the profile and quietly escape sharing.
+        os.symlink(target, local)
 
     withheld = split_claude_json(profiles_dir, profile)
     return {"seeded": seeded, "merged": merged, "archived": archived,
@@ -504,8 +507,20 @@ def repair_sharing(profiles_dir, profile):
         elif name == "history.jsonl":
             merge_history(local, target)
             os.remove(local)
+        elif not os.path.exists(target) or files_equal(local, target):
+            shutil.move(local, target)
         else:
-            shutil.move(local, target)   # the profile's copy is the fresher one
+            # Both sides hold different content. The profile's copy is usually
+            # the fresher one, but another profile may have written to the pool
+            # in the meantime, so compare instead of assuming — and keep the
+            # loser rather than discarding it.
+            archive = archive_dir(profile_path)
+            os.makedirs(archive, exist_ok=True)
+            if os.path.getmtime(local) >= os.path.getmtime(target):
+                shutil.copy2(target, os.path.join(archive, name))
+                shutil.move(local, target)
+            else:
+                shutil.move(local, os.path.join(archive, name))
 
         if name in SHARED_DIRS:
             os.makedirs(target, exist_ok=True)

@@ -449,3 +449,69 @@ def test_split_takes_the_lock_without_deadlocking(profiles_dir):
     pool_config = json.load(open(os.path.join(sharing.pool_dir(profiles_dir),
                                               "claude.shared.json")))
     assert pool_config["flag"] == 1
+
+
+# --- issues raised in review ------------------------------------------------
+
+def test_file_absent_on_both_sides_is_still_linked(profiles_dir):
+    """Nobody has settings.json yet. Without a link, the first one the app
+    writes lands in the profile and quietly escapes sharing."""
+    make_profile(profiles_dir, "trabalho", "t@example.com")  # no settings.json
+    sharing.enable_sharing(profiles_dir, "trabalho")
+
+    link = os.path.join(profiles_dir, "trabalho", "settings.json")
+    assert os.path.islink(link), "a symlink may dangle; that is fine"
+
+    # writing through the dangling link creates the file inside the pool
+    json.dump({"theme": "dark"}, open(link, "w"))
+    pool_file = os.path.join(sharing.pool_dir(profiles_dir), "settings.json")
+    assert os.path.exists(pool_file)
+
+    make_profile(profiles_dir, "pessoal", "p@example.org")
+    sharing.enable_sharing(profiles_dir, "pessoal")
+    other = os.path.join(profiles_dir, "pessoal", "settings.json")
+    assert json.load(open(other))["theme"] == "dark", "it reached the second profile"
+
+
+def test_repair_does_not_clobber_newer_pool_content(profiles_dir):
+    """The profile's copy is usually fresher, but another profile may have
+    written to the pool meanwhile."""
+    make_profile(profiles_dir, "trabalho", "t@example.com", settings={"theme": "dark"})
+    sharing.enable_sharing(profiles_dir, "trabalho")
+
+    link = os.path.join(profiles_dir, "trabalho", "settings.json")
+    pool_file = os.path.join(sharing.pool_dir(profiles_dir), "settings.json")
+
+    # the link breaks and the profile writes an old value
+    os.unlink(link)
+    json.dump({"theme": "stale"}, open(link, "w"))
+    os.utime(link, (1000, 1000))
+    # meanwhile another profile updates the pool, more recently
+    json.dump({"theme": "newer"}, open(pool_file, "w"))
+    os.utime(pool_file, (2000, 2000))
+
+    sharing.repair_sharing(profiles_dir, "trabalho")
+
+    assert json.load(open(pool_file))["theme"] == "newer", "newer content survives"
+    archived = [d for d in os.listdir(os.path.join(profiles_dir, "trabalho"))
+                if d.startswith("_archive-")]
+    assert archived, "and the losing copy is kept, not discarded"
+    kept = os.path.join(profiles_dir, "trabalho", archived[0], "settings.json")
+    assert json.load(open(kept))["theme"] == "stale"
+
+
+def test_repair_promotes_when_the_profile_is_newer(profiles_dir):
+    make_profile(profiles_dir, "trabalho", "t@example.com", settings={"theme": "dark"})
+    sharing.enable_sharing(profiles_dir, "trabalho")
+    link = os.path.join(profiles_dir, "trabalho", "settings.json")
+    pool_file = os.path.join(sharing.pool_dir(profiles_dir), "settings.json")
+
+    os.unlink(link)
+    json.dump({"theme": "fresher"}, open(link, "w"))
+    os.utime(pool_file, (1000, 1000))
+    os.utime(link, (2000, 2000))
+
+    sharing.repair_sharing(profiles_dir, "trabalho")
+
+    assert json.load(open(pool_file))["theme"] == "fresher"
+    assert os.path.islink(link)

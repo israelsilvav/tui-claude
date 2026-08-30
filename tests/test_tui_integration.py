@@ -281,3 +281,37 @@ def test_toggling_a_logged_in_profile_keeps_its_account(tui):
     assert config["oauthAccount"]["emailAddress"] == "t@example.com", \
         "a full round trip through the pool never disturbs the login"
     assert config["projects"]["/p"]["allowedTools"] == ["Bash"]
+
+
+def test_pool_summary_reflects_what_repair_promoted(tui):
+    """state["pool"] must be read after the healing pass, not before."""
+    tui.add_profile("trabalho")
+    sharing.enable_sharing(tui.PROFILES_DIR, "trabalho")
+    tui.refresh_profiles()
+    assert tui.state["pool"]["conversations"] == 0
+
+    # the link breaks and work happens offline, inside the profile
+    link = os.path.join(tui.PROFILES_DIR, "trabalho", "projects")
+    os.unlink(link)
+    os.makedirs(os.path.join(link, "-home-user"))
+    open(os.path.join(link, "-home-user", "offline.jsonl"), "w").write("{}")
+
+    tui.refresh_profiles()
+
+    assert tui.state["pool"]["conversations"] == 1, \
+        "the summary shows the repaired pool, not the stale one"
+
+
+def test_enable_dialogue_handles_a_pool_with_no_members(tui):
+    """The pool outlives its last member by design, so it can be empty-handed."""
+    tui.add_profile("trabalho")
+    sharing.enable_sharing(tui.PROFILES_DIR, "trabalho")
+    sharing.disable_sharing(tui.PROFILES_DIR, "trabalho", take_copy=False)
+    tui.add_profile("segundo")
+    tui.refresh_profiles()
+    term = FakeTerminal("y")
+
+    tui.enable_sharing_flow("segundo", term.ask, term.say)
+
+    assert "used by ." not in term.screen
+    assert "used by no profile" in term.screen

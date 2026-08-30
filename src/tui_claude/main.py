@@ -122,19 +122,20 @@ def refresh_profiles():
                 profiles.append(name)
     state["profiles"] = sorted(profiles)
 
-    state["sharing"] = {name: sharing.is_shared(PROFILES_DIR, name)
-                        for name in state["profiles"]}
-    state["pool"] = sharing.pool_summary(PROFILES_DIR)
-
     # An atomic write by Claude Code can replace a symlink with a real file,
-    # dropping that one item out of the pool without raising anything. Put it
-    # back, keeping whichever content is newer.
+    # dropping that one item out of the pool without raising anything. Repair
+    # first, then read the state: repairs promote content into the pool and
+    # would otherwise leave the table showing a stale size and count.
     healed = []
     for name in state["profiles"]:
         healed += sharing.repair_sharing(PROFILES_DIR, name)
     if healed and not state["message"]:
         state["message"] = f"Re-linked to the shared pool: {', '.join(sorted(set(healed)))}."
         state["message_style"] = "info"
+
+    state["sharing"] = {name: sharing.is_shared(PROFILES_DIR, name)
+                        for name in state["profiles"]}
+    state["pool"] = sharing.pool_summary(PROFILES_DIR)
 
     # Find active profile
     state["active_profile"] = None
@@ -365,10 +366,14 @@ def enable_sharing_flow(selected, ask=input, say=print):
         say("settings and skills stay exactly as they are, and any other")
         say("profile you share later will see them.")
     else:
-        others = [p for p in state["profiles"] if state["sharing"].get(p)]
+        # The pool outlives its last member by design, so it can exist with
+        # nobody in it.
+        others = [p for p in state["profiles"]
+                  if p != selected and state["sharing"].get(p)]
+        used_by = f"used by {', '.join(others)}" if others else \
+            "currently used by no profile"
         say(f"Shared pool: {pool['conversations']} conversations, "
-            f"{sharing.human_size(pool['bytes'])}, "
-            f"used by {', '.join(others)}.")
+            f"{sharing.human_size(pool['bytes'])}, {used_by}.")
         say(f"\n'{selected}' will join it, bringing its own data in:")
         say("  - conversations, memory and snapshots merge (names never collide)")
         say("  - a settings file that disagrees with the pool's is kept aside")
