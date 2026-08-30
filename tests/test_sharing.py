@@ -515,3 +515,54 @@ def test_repair_promotes_when_the_profile_is_newer(profiles_dir):
 
     assert json.load(open(pool_file))["theme"] == "fresher"
     assert os.path.islink(link)
+
+
+# --- platform portability ---------------------------------------------------
+
+def test_module_imports_without_a_locking_backend():
+    """`import fcntl` fails on Windows. It must not break importing the module,
+    which otherwise only needs os.symlink — available there under Developer
+    Mode. Setting sys.modules[name] = None makes the import raise ImportError."""
+    import importlib
+    import sys
+
+    saved = {k: sys.modules.get(k) for k in ("fcntl", "msvcrt", "tui_claude.sharing")}
+    try:
+        sys.modules["fcntl"] = None
+        sys.modules["msvcrt"] = None
+        sys.modules.pop("tui_claude.sharing", None)
+        reimported = importlib.import_module("tui_claude.sharing")
+        assert reimported.fcntl is None
+        assert reimported.msvcrt is None
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value
+        importlib.reload(sharing)
+
+
+def test_pool_lock_still_runs_without_a_backend(profiles_dir, monkeypatch):
+    """Degrade to no locking rather than refusing to manage profiles."""
+    monkeypatch.setattr(sharing, "fcntl", None)
+    monkeypatch.setattr(sharing, "msvcrt", None)
+
+    open_fds = lambda: len(os.listdir("/proc/self/fd"))
+    before = open_fds()
+
+    with sharing.pool_lock(profiles_dir):
+        pass
+
+    assert open_fds() == before, "the lock file handle is closed either way"
+
+
+def test_pool_lock_closes_its_handle_when_the_body_raises(profiles_dir):
+    open_fds = lambda: len(os.listdir("/proc/self/fd"))
+    before = open_fds()
+
+    with pytest.raises(RuntimeError):
+        with sharing.pool_lock(profiles_dir):
+            raise RuntimeError("boom")
+
+    assert open_fds() == before, "no file descriptor leaks on the error path"
