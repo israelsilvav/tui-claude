@@ -131,3 +131,153 @@ def test_deleting_a_shared_profile_keeps_the_pool(tui):
     assert "pessoal" not in tui.state["profiles"]
     assert os.path.exists(os.path.join(projects, "conversa.jsonl"))
     assert tui.state["sharing"]["trabalho"] is True
+
+
+# --- the interactive dialogues ----------------------------------------------
+
+class FakeTerminal:
+    """Feeds scripted answers to a flow and records what it printed."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.output = []
+
+    def ask(self, prompt):
+        self.output.append(prompt)
+        return self.answers.pop(0)
+
+    def say(self, *args):
+        self.output.append(" ".join(str(a) for a in args))
+
+    @property
+    def screen(self):
+        return "\n".join(self.output)
+
+
+def test_enable_flow_explains_seeding_then_shares(tui):
+    tui.add_profile("trabalho")
+    tui.refresh_profiles()
+    term = FakeTerminal("y")
+
+    assert tui.enable_sharing_flow("trabalho", term.ask, term.say) is True
+
+    assert "will become the pool" in term.screen
+    assert "NOT shared" in term.screen, "the identity boundary is stated up front"
+    tui.refresh_profiles()
+    assert tui.state["sharing"]["trabalho"] is True
+    assert "now shares data" in tui.state["message"]
+
+
+def test_enable_flow_declined_changes_nothing(tui):
+    tui.add_profile("trabalho")
+    tui.refresh_profiles()
+
+    assert tui.enable_sharing_flow("trabalho", FakeTerminal("n").ask, lambda *a: None) is False
+
+    tui.refresh_profiles()
+    assert tui.state["sharing"]["trabalho"] is False
+    assert tui.state["pool"] is None, "declining does not create a pool"
+
+
+def test_enable_flow_reports_the_pool_it_is_joining(tui):
+    tui.add_profile("trabalho")
+    sharing.enable_sharing(tui.PROFILES_DIR, "trabalho")
+    projects = os.path.join(sharing.pool_dir(tui.PROFILES_DIR), "projects")
+    os.makedirs(projects, exist_ok=True)
+    open(os.path.join(projects, "conversa.jsonl"), "w").write("{}")
+    tui.add_profile("segundo")
+    tui.refresh_profiles()
+    term = FakeTerminal("y")
+
+    tui.enable_sharing_flow("segundo", term.ask, term.say)
+
+    assert "1 conversations" in term.screen
+    assert "used by trabalho" in term.screen, "the user sees who else is in"
+
+
+def test_disable_flow_keeping_a_copy(tui):
+    tui.add_profile("trabalho")
+    tui.add_profile("pessoal")
+    for name in ("trabalho", "pessoal"):
+        sharing.enable_sharing(tui.PROFILES_DIR, name)
+    projects = os.path.join(sharing.pool_dir(tui.PROFILES_DIR), "projects")
+    os.makedirs(projects, exist_ok=True)
+    open(os.path.join(projects, "conversa.jsonl"), "w").write("{}")
+    tui.refresh_profiles()
+    term = FakeTerminal("k")
+
+    assert tui.disable_sharing_flow("pessoal", term.ask, term.say) is True
+
+    assert "Keep a copy" in term.screen and "Start empty" in term.screen
+    tui.refresh_profiles()
+    assert tui.state["sharing"]["pessoal"] is False
+    own = os.path.join(tui.PROFILES_DIR, "pessoal", "projects")
+    assert "conversa.jsonl" in os.listdir(own), "it took the pool with it"
+    assert tui.state["sharing"]["trabalho"] is True, "the other profile is untouched"
+
+
+def test_disable_flow_starting_empty(tui):
+    tui.add_profile("trabalho")
+    tui.add_profile("pessoal")
+    for name in ("trabalho", "pessoal"):
+        sharing.enable_sharing(tui.PROFILES_DIR, name)
+    projects = os.path.join(sharing.pool_dir(tui.PROFILES_DIR), "projects")
+    os.makedirs(projects, exist_ok=True)
+    open(os.path.join(projects, "conversa.jsonl"), "w").write("{}")
+    tui.refresh_profiles()
+
+    tui.disable_sharing_flow("pessoal", FakeTerminal("e").ask, lambda *a: None)
+
+    tui.refresh_profiles()
+    assert tui.state["sharing"]["pessoal"] is False
+    assert os.listdir(os.path.join(tui.PROFILES_DIR, "pessoal", "projects")) == []
+    assert "conversa.jsonl" in os.listdir(projects), "the pool survives"
+
+
+def test_disable_flow_cancelled_leaves_sharing_on(tui):
+    tui.add_profile("trabalho")
+    sharing.enable_sharing(tui.PROFILES_DIR, "trabalho")
+    tui.refresh_profiles()
+
+    assert tui.disable_sharing_flow("trabalho", FakeTerminal("c").ask, lambda *a: None) is False
+
+    tui.refresh_profiles()
+    assert tui.state["sharing"]["trabalho"] is True
+    assert tui.state["message"] == "Sharing unchanged."
+
+
+def test_toggling_the_active_profile_keeps_the_symlinks_valid(tui):
+    tui.add_profile("trabalho")
+    tui.switch_profile("trabalho")
+    tui.refresh_profiles()
+    assert tui.state["active_profile"] == "trabalho"
+
+    tui.enable_sharing_flow("trabalho", FakeTerminal("y").ask, lambda *a: None)
+    tui.refresh_profiles()
+
+    assert os.path.realpath(tui.CLAUDE_DIR) == \
+        os.path.realpath(os.path.join(tui.PROFILES_DIR, "trabalho"))
+    # A brand new profile has no claude.json until Claude Code writes one, so
+    # assert where the link points, not that the target exists yet.
+    assert os.readlink(tui.CLAUDE_JSON) == \
+        os.path.join(tui.PROFILES_DIR, "trabalho", "claude.json")
+    assert tui.state["sharing"]["trabalho"] is True
+
+
+def test_toggling_a_logged_in_profile_keeps_its_account(tui):
+    tui.add_profile("trabalho")
+    config_path = os.path.join(tui.PROFILES_DIR, "trabalho", "claude.json")
+    with open(config_path, "w") as handle:
+        json.dump({"oauthAccount": {"emailAddress": "t@example.com"},
+                   "userID": "userid-trabalho-" + "0" * 16,
+                   "projects": {"/p": {"allowedTools": ["Bash"]}}}, handle)
+    tui.switch_profile("trabalho")
+    tui.refresh_profiles()
+
+    tui.enable_sharing_flow("trabalho", FakeTerminal("y").ask, lambda *a: None)
+    tui.disable_sharing_flow("trabalho", FakeTerminal("k").ask, lambda *a: None)
+
+    config = json.load(open(config_path))
+    assert config["oauthAccount"]["emailAddress"] == "t@example.com", \
+        "a full round trip through the pool never disturbs the login"
+    assert config["projects"]["/p"]["allowedTools"] == ["Bash"]

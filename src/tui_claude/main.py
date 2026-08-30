@@ -351,6 +351,85 @@ def do_remove(event):
     import asyncio
     asyncio.create_task(remove_flow())
 
+def enable_sharing_flow(selected, ask=input, say=print):
+    """Ask, then move `selected` into the shared pool. Returns True if it did.
+
+    `ask` and `say` are injected so the whole dialogue can be driven by tests
+    without a terminal.
+    """
+    pool = sharing.pool_summary(PROFILES_DIR)
+    say(f"=== SHARE DATA: {selected} ===\n")
+    if pool is None:
+        say("No shared pool exists yet.")
+        say(f"'{selected}' will become the pool: its conversations, memory,")
+        say("settings and skills stay exactly as they are, and any other")
+        say("profile you share later will see them.")
+    else:
+        others = [p for p in state["profiles"] if state["sharing"].get(p)]
+        say(f"Shared pool: {pool['conversations']} conversations, "
+            f"{sharing.human_size(pool['bytes'])}, "
+            f"used by {', '.join(others)}.")
+        say(f"\n'{selected}' will join it, bringing its own data in:")
+        say("  - conversations, memory and snapshots merge (names never collide)")
+        say("  - a settings file that disagrees with the pool's is kept aside")
+        say("    in an _archive folder, never deleted")
+    say("\nCredentials and account identity are NOT shared.\n")
+
+    if ask(f"Share data for '{selected}'? (y/N): ").strip().lower() != "y":
+        state["message"] = "Sharing unchanged."
+        state["message_style"] = "info"
+        return False
+
+    result = sharing.enable_sharing(PROFILES_DIR, selected)
+    if selected == state["active_profile"]:
+        switch_profile(selected)  # refresh the symlinks in place
+
+    parts = ["seeded the pool"] if result["seeded"] else []
+    if result["merged"]:
+        parts.append(f"{result['merged']} file(s) merged")
+    if result["archived"]:
+        parts.append(f"{result['archived']} kept in {os.path.basename(result['archive'])}")
+    if result["withheld"]:
+        parts.append(f"{len(result['withheld'])} account key(s) withheld")
+    state["message"] = f"'{selected}' now shares data" + (
+        " (" + ", ".join(parts) + ")." if parts else ".")
+    state["message_style"] = "success"
+    return True
+
+
+def disable_sharing_flow(selected, ask=input, say=print):
+    """Ask what to keep, then take `selected` out of the pool."""
+    pool = sharing.pool_summary(PROFILES_DIR)
+    size = sharing.human_size(pool["bytes"]) if pool else "0 B"
+    count = pool["conversations"] if pool else 0
+    say(f"=== STOP SHARING: {selected} ===\n")
+    say(f"'{selected}' currently reads {count} conversation(s) from the")
+    say(f"shared pool ({size}). What should it keep?\n")
+    say(f"  [k] Keep a copy  - fork the pool into '{selected}' and diverge")
+    say(f"                     from there (uses another {size} on disk)")
+    say(f"  [e] Start empty  - '{selected}' begins with no conversations")
+    say( "  [c] Cancel\n")
+    say("Either way the pool itself is untouched, and other profiles")
+    say("keep reading it normally.\n")
+
+    choice = ask("Choice [k/e/c]: ").strip().lower()
+    if choice not in ("k", "e"):
+        state["message"] = "Sharing unchanged."
+        state["message_style"] = "info"
+        return False
+
+    result = sharing.disable_sharing(PROFILES_DIR, selected, take_copy=(choice == "k"))
+    if selected == state["active_profile"]:
+        switch_profile(selected)
+    if choice == "k":
+        state["message"] = (f"'{selected}' is isolated with its own copy "
+                            f"({result['copied']} file(s)).")
+    else:
+        state["message"] = f"'{selected}' is isolated and starts empty."
+    state["message_style"] = "success"
+    return True
+
+
 @kb.add("s")
 def do_toggle_sharing(event):
     """Move the selected profile in or out of the shared data pool."""
@@ -360,77 +439,14 @@ def do_toggle_sharing(event):
     selected = state["profiles"][state["selected_index"]]
     currently_shared = state["sharing"].get(selected, False)
 
-    def prompt_enable():
-        pool = sharing.pool_summary(PROFILES_DIR)
-        print(f"=== SHARE DATA: {selected} ===\n")
-        if pool is None:
-            print("No shared pool exists yet.")
-            print(f"'{selected}' will become the pool: its conversations, memory,")
-            print("settings and skills stay exactly as they are, and any other")
-            print("profile you share later will see them.")
-        else:
-            others = [p for p in state["profiles"] if state["sharing"].get(p)]
-            print(f"Shared pool: {pool['conversations']} conversations, "
-                  f"{sharing.human_size(pool['bytes'])}, "
-                  f"used by {', '.join(others)}.")
-            print(f"\n'{selected}' will join it, bringing its own data in:")
-            print("  - conversations, memory and snapshots merge (names never collide)")
-            print("  - a settings file that disagrees with the pool's is kept aside")
-            print("    in an _archive folder, never deleted")
-        print("\nCredentials and account identity are NOT shared.\n")
-        if input(f"Share data for '{selected}'? (y/N): ").strip().lower() != "y":
-            state["message"] = "Sharing unchanged."
-            state["message_style"] = "info"
-            return
-
-        result = sharing.enable_sharing(PROFILES_DIR, selected)
-        if selected == state["active_profile"]:
-            switch_profile(selected)  # refresh the symlinks in place
-        parts = ["seeded the pool"] if result["seeded"] else []
-        if result["merged"]:
-            parts.append(f"{result['merged']} file(s) merged")
-        if result["archived"]:
-            parts.append(f"{result['archived']} kept in {os.path.basename(result['archive'])}")
-        if result["withheld"]:
-            parts.append(f"{len(result['withheld'])} account key(s) withheld")
-        state["message"] = f"'{selected}' now shares data" + (
-            " (" + ", ".join(parts) + ")." if parts else ".")
-        state["message_style"] = "success"
-
-    def prompt_disable():
-        pool = sharing.pool_summary(PROFILES_DIR)
-        size = sharing.human_size(pool["bytes"]) if pool else "0 B"
-        count = pool["conversations"] if pool else 0
-        print(f"=== STOP SHARING: {selected} ===\n")
-        print(f"'{selected}' currently reads {count} conversation(s) from the")
-        print(f"shared pool ({size}). What should it keep?\n")
-        print(f"  [k] Keep a copy  - fork the pool into '{selected}' and diverge")
-        print(f"                     from there (uses another {size} on disk)")
-        print(f"  [e] Start empty  - '{selected}' begins with no conversations")
-        print( "  [c] Cancel\n")
-        print("Either way the pool itself is untouched, and other profiles")
-        print("keep reading it normally.\n")
-        choice = input("Choice [k/e/c]: ").strip().lower()
-        if choice not in ("k", "e"):
-            state["message"] = "Sharing unchanged."
-            state["message_style"] = "info"
-            return
-
-        result = sharing.disable_sharing(PROFILES_DIR, selected, take_copy=(choice == "k"))
-        if selected == state["active_profile"]:
-            switch_profile(selected)
-        if choice == "k":
-            state["message"] = (f"'{selected}' is isolated with its own copy "
-                                f"({result['copied']} file(s)).")
-        else:
-            state["message"] = f"'{selected}' is isolated and starts empty."
-        state["message_style"] = "success"
-
     async def toggle_flow():
         def run():
             print("\n" * 2)
             try:
-                prompt_disable() if currently_shared else prompt_enable()
+                if currently_shared:
+                    disable_sharing_flow(selected)
+                else:
+                    enable_sharing_flow(selected)
             except Exception as exc:
                 state["message"] = f"Sharing failed: {exc}"
                 state["message_style"] = "error"
