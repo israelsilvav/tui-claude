@@ -12,6 +12,15 @@ dependencies = [
 [project.scripts]
 tui-claude = "tui_claude.main:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
