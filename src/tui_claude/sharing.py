@@ -25,11 +25,22 @@ it point into the pool?), so there is no config file to drift out of sync.
 """
 
 import contextlib
-import fcntl
 import json
 import os
 import shutil
 import time
+
+# File locking is platform-specific and the rest of this module is not, so
+# neither backend is a hard requirement: the project runs anywhere os.symlink
+# does, which on Windows means Developer Mode or an elevated shell.
+try:
+    import fcntl                              # POSIX
+except ImportError:                           # pragma: no cover - platform
+    fcntl = None
+try:
+    import msvcrt                             # Windows
+except ImportError:                           # pragma: no cover - platform
+    msvcrt = None
 
 # Reserved directory inside PROFILES_DIR; refresh_profiles() must skip "_*".
 POOL_NAME = "_shared"
@@ -141,6 +152,21 @@ def pool_dir(profiles_dir):
     return os.path.join(profiles_dir, POOL_NAME)
 
 
+def _take_lock(handle):
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+    elif msvcrt is not None:                  # pragma: no cover - platform
+        msvcrt.locking(handle, msvcrt.LK_LOCK, 1)
+
+
+def _release_lock(handle):
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    elif msvcrt is not None:                  # pragma: no cover - platform
+        os.lseek(handle, 0, os.SEEK_SET)
+        msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
+
+
 @contextlib.contextmanager
 def pool_lock(profiles_dir):
     """Serialise read-modify-write on the pool's shared config.
@@ -148,16 +174,22 @@ def pool_lock(profiles_dir):
     save_json is already atomic, so an unlocked write cannot corrupt the file
     — but two TUIs that read, merge and write around each other would drop one
     of the two updates. This closes that window.
+
+    With neither locking backend available the body still runs: the window
+    reopens, which costs one update in the rare case of two instances writing
+    at once, and is better than refusing to manage profiles at all.
     """
     pool = pool_dir(profiles_dir)
     os.makedirs(pool, exist_ok=True)
     handle = os.open(os.path.join(pool, ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        _take_lock(handle)
         yield
     finally:
-        fcntl.flock(handle, fcntl.LOCK_UN)
-        os.close(handle)
+        try:
+            _release_lock(handle)
+        finally:
+            os.close(handle)
 
 
 def pool_exists(profiles_dir):

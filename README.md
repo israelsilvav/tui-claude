@@ -30,7 +30,8 @@ Claude Code keeps everything for one account in `~/.claude` — credentials, con
 
 ## Install
 
-Requires Python 3.12+.
+Requires Python 3.12+. Linux and macOS work out of the box; on Windows the
+profile symlinks need Developer Mode or an elevated shell.
 
 ```bash
 git clone https://github.com/dnilsonc/tui-claude
