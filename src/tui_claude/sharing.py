@@ -144,12 +144,20 @@ def pool_exists(profiles_dir):
 
 
 def is_shared(profiles_dir, profile):
-    """A profile shares when its `projects` points into the pool."""
-    link = os.path.join(profiles_dir, profile, "projects")
-    if not os.path.islink(link):
-        return False
-    target = os.path.join(pool_dir(profiles_dir), "projects")
-    return os.path.realpath(link) == os.path.realpath(target)
+    """A profile shares when any of its items points into the pool.
+
+    Deliberately "any" and not "projects": an atomic write can turn a single
+    link back into a real file, and if that item were the sentinel the profile
+    would read as isolated and never get repaired.
+    """
+    profile_path = os.path.join(profiles_dir, profile)
+    pool = pool_dir(profiles_dir)
+    for name in SHARED_DIRS + SHARED_FILES:
+        link = os.path.join(profile_path, name)
+        if os.path.islink(link) and \
+                os.path.realpath(link) == os.path.realpath(os.path.join(pool, name)):
+            return True
+    return False
 
 
 def shared_profiles(profiles_dir, profiles):
@@ -441,6 +449,46 @@ def disable_sharing(profiles_dir, profile, take_copy):
             copied += 1
 
     return {"copied": copied}
+
+
+def repair_sharing(profiles_dir, profile):
+    """Re-link items that silently fell out of the pool.
+
+    An atomic write (write to .tmp, rename over the target) replaces a symlink
+    with a real file, so a profile can stop sharing one file without any error
+    being raised. The content that landed in the profile is the newer one, so
+    it is promoted into the pool before the link is restored. Returns the names
+    that had to be repaired.
+    """
+    if not is_shared(profiles_dir, profile):
+        return []
+
+    profile_path = os.path.join(profiles_dir, profile)
+    pool = pool_dir(profiles_dir)
+    repaired = []
+
+    for name in SHARED_DIRS + SHARED_FILES:
+        local = os.path.join(profile_path, name)
+        target = os.path.join(pool, name)
+        if os.path.islink(local) or not os.path.exists(local):
+            continue
+
+        if os.path.isdir(local):
+            merge_tree(local, target, os.path.join(archive_dir(profile_path), name))
+            shutil.rmtree(local)
+        elif name == "history.jsonl":
+            merge_history(local, target)
+            os.remove(local)
+        else:
+            shutil.move(local, target)   # the profile's copy is the fresher one
+
+        if name in SHARED_DIRS:
+            os.makedirs(target, exist_ok=True)
+        if os.path.exists(target):
+            os.symlink(target, local)
+            repaired.append(name)
+
+    return repaired
 
 
 def sync_on_switch(profiles_dir, leaving, entering):

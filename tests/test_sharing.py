@@ -348,3 +348,59 @@ def test_isolated_profile_is_untouched_by_switching(profiles_dir):
     assert not sharing.is_shared(profiles_dir, "isolado")
     own = os.listdir(os.path.join(profiles_dir, "isolado", "projects", "-home-user"))
     assert own == ["bbb.jsonl"], "an isolated profile sees only its own data"
+
+
+# --- self-healing -----------------------------------------------------------
+
+def test_atomic_write_that_breaks_a_symlink_is_repaired(profiles_dir):
+    """Writing to .tmp and renaming over the target replaces the symlink with
+    a real file, dropping that item from the pool with no error raised."""
+    make_profile(profiles_dir, "trabalho", "t@example.com", settings={"theme": "dark"})
+    make_profile(profiles_dir, "pessoal", "p@example.org")
+    sharing.enable_sharing(profiles_dir, "trabalho")
+    sharing.enable_sharing(profiles_dir, "pessoal")
+
+    link = os.path.join(profiles_dir, "trabalho", "settings.json")
+    tmp = link + ".tmp"
+    json.dump({"theme": "light"}, open(tmp, "w"))
+    os.replace(tmp, link)                      # symlink is gone
+    assert not os.path.islink(link)
+
+    repaired = sharing.repair_sharing(profiles_dir, "trabalho")
+
+    assert "settings.json" in repaired
+    assert os.path.islink(link)
+    # the newer content won and reached the other profile through the pool
+    other = os.path.join(profiles_dir, "pessoal", "settings.json")
+    assert json.load(open(other))["theme"] == "light"
+
+
+def test_repair_merges_a_directory_that_came_back_as_real(profiles_dir):
+    make_profile(profiles_dir, "trabalho", "t@example.com", conversations=["aaa"])
+    sharing.enable_sharing(profiles_dir, "trabalho")
+
+    link = os.path.join(profiles_dir, "trabalho", "projects")
+    os.unlink(link)
+    os.makedirs(os.path.join(link, "-home-user"))
+    with open(os.path.join(link, "-home-user", "offline.jsonl"), "w") as handle:
+        handle.write("{}")
+
+    sharing.repair_sharing(profiles_dir, "trabalho")
+
+    assert conversations_in_pool(profiles_dir) == ["aaa.jsonl", "offline.jsonl"], \
+        "work done while unlinked is merged back, not lost"
+
+
+def test_repair_is_a_noop_for_isolated_profiles(profiles_dir):
+    make_profile(profiles_dir, "cliente", "c@example.net", conversations=["aaa"])
+
+    assert sharing.repair_sharing(profiles_dir, "cliente") == []
+    assert not sharing.is_shared(profiles_dir, "cliente")
+
+
+def test_repair_is_idempotent(profiles_dir):
+    make_profile(profiles_dir, "trabalho", "t@example.com", settings={"theme": "dark"})
+    sharing.enable_sharing(profiles_dir, "trabalho")
+
+    assert sharing.repair_sharing(profiles_dir, "trabalho") == []
+    assert sharing.repair_sharing(profiles_dir, "trabalho") == []

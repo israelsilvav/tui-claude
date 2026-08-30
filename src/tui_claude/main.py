@@ -126,6 +126,16 @@ def refresh_profiles():
                         for name in state["profiles"]}
     state["pool"] = sharing.pool_summary(PROFILES_DIR)
 
+    # An atomic write by Claude Code can replace a symlink with a real file,
+    # dropping that one item out of the pool without raising anything. Put it
+    # back, keeping whichever content is newer.
+    healed = []
+    for name in state["profiles"]:
+        healed += sharing.repair_sharing(PROFILES_DIR, name)
+    if healed and not state["message"]:
+        state["message"] = f"Re-linked to the shared pool: {', '.join(sorted(set(healed)))}."
+        state["message_style"] = "info"
+
     # Find active profile
     state["active_profile"] = None
     if os.path.islink(CLAUDE_DIR):
