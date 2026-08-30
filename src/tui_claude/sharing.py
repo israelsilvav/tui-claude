@@ -4,20 +4,20 @@ Profiles exist to switch accounts, not to fragment your work. This module lets
 any number of profiles point at one pool of conversations, memory and settings
 while each keeps its own credentials.
 
-Layout, with `trabalho` and `pessoal` sharing and `cliente-x` isolated:
+Layout, with `work` and `personal` sharing and `client-x` isolated:
 
     ~/.claude-profiles/
         _shared/                    <- the pool (reserved name, never a profile)
             projects/               <- conversations + memory
             settings.json
             claude.shared.json      <- claude.json minus anything account-bound
-        trabalho/
+        work/
             projects -> ../_shared/projects
             settings.json -> ../_shared/settings.json
             .credentials.json       <- real file, never shared
             claude.account.json     <- identity split out of claude.json
             claude.json             <- rebuilt = shared + account, on every switch
-        cliente-x/
+        client-x/
             projects/               <- real directory, sees none of the above
 
 Whether a profile shares is read from the filesystem itself (does anything in

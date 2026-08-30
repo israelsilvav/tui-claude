@@ -9,21 +9,21 @@ Claude Code keeps everything for one account in `~/.claude` — credentials, con
  │               CLAUDE CODE PROFILE MANAGER              │
  └────────────────────────────────────────────────────────┘
 
- Active profile: ● trabalho
- Config location: ~/.claude -> ~/.claude-profiles/trabalho
- Account cache: ~/.claude.json -> ~/.claude-profiles/trabalho/claude.json
+ Active profile: ● work
+ Config location: ~/.claude -> ~/.claude-profiles/work
+ Account cache: ~/.claude.json -> ~/.claude-profiles/work/claude.json
  Login command: claude auth login
 
  ┌──────────────────────────────┬───────────────┬──────────────┐
  │ Profile Name                 │ Status        │ Data         │
  ├──────────────────────────────┼───────────────┼──────────────┤
- │ cliente-x                    │   inactive    │ ⊘ isolated   │
- │ pessoal                      │   inactive    │ ⇄ shared     │
- │ trabalho                     │ ● ACTIVE      │ ⇄ shared     │
+ │ client-x                     │   inactive    │ ⊘ isolated   │
+ │ personal                     │   inactive    │ ⇄ shared     │
+ │ work                         │ ● ACTIVE      │ ⇄ shared     │
  └──────────────────────────────┴───────────────┴──────────────┘
  Shared pool: 7 conversations, 5.5 KB, 2 profile(s)
 
- [Enter] Switch Profile  [A] Add  [R] Remove  [L] Login  [S] Share Data  [C] Set Command  [Q] Quit
+ [Enter] Switch Profile   [A] Add   [R] Remove   [L] Login   [S] Share Data   [C] Set Command   [Q] Quit
 ```
 
 ---
@@ -147,7 +147,7 @@ An atomic write — write to `.tmp`, rename over the target — replaces a symli
         claude.shared.json        claude.json minus anything account-bound
         .lock
 
-    trabalho/                     a shared profile
+    work/                         a shared profile
         projects        -> ../_shared/projects
         settings.json   -> ../_shared/settings.json
         .credentials.json         real file, never shared
@@ -155,7 +155,7 @@ An atomic write — write to `.tmp`, rename over the target — replaces a symli
         claude.baseline.json      what the pool looked like at the last switch
         claude.json               rebuilt = shared + account
 
-    cliente-x/                    an isolated profile
+    client-x/                     an isolated profile
         projects/                 real directory, sees none of the above
         .credentials.json
         claude.json
