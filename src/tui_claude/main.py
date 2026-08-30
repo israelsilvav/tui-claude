@@ -11,6 +11,8 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.styles import Style
 
+from . import sharing
+
 TEST_DIR = os.environ.get("TUI_CLAUDE_TEST_DIR")
 if TEST_DIR:
     PROFILES_DIR = os.path.join(TEST_DIR, "claude-profiles")
@@ -28,7 +30,9 @@ state = {
     "selected_index": 0,
     "login_command": "claude auth login",
     "message": "",
-    "message_style": "info"
+    "message_style": "info",
+    "sharing": {},       # profile name -> bool, read from the filesystem
+    "pool": None,        # summary of the shared pool, or None if there is none
 }
 
 def init_profiles():
@@ -113,9 +117,25 @@ def refresh_profiles():
     if os.path.exists(PROFILES_DIR):
         for name in os.listdir(PROFILES_DIR):
             full_path = os.path.join(PROFILES_DIR, name)
-            if os.path.isdir(full_path):
+            # "_" is reserved for internals such as the shared pool
+            if os.path.isdir(full_path) and not name.startswith("_"):
                 profiles.append(name)
     state["profiles"] = sorted(profiles)
+
+    # An atomic write by Claude Code can replace a symlink with a real file,
+    # dropping that one item out of the pool without raising anything. Repair
+    # first, then read the state: repairs promote content into the pool and
+    # would otherwise leave the table showing a stale size and count.
+    healed = []
+    for name in state["profiles"]:
+        healed += sharing.repair_sharing(PROFILES_DIR, name)
+    if healed and not state["message"]:
+        state["message"] = f"Re-linked to the shared pool: {', '.join(sorted(set(healed)))}."
+        state["message_style"] = "info"
+
+    state["sharing"] = {name: sharing.is_shared(PROFILES_DIR, name)
+                        for name in state["profiles"]}
+    state["pool"] = sharing.pool_summary(PROFILES_DIR)
 
     # Find active profile
     state["active_profile"] = None
@@ -144,6 +164,11 @@ def switch_profile(name):
         return False
 
     try:
+        # The only instant where both profiles are known and neither is in use:
+        # hand the pool what the outgoing profile changed, then dress the
+        # incoming one with it. No-op unless the profiles share.
+        sharing.sync_on_switch(PROFILES_DIR, state["active_profile"], name)
+
         if os.path.lexists(CLAUDE_DIR):
             os.unlink(CLAUDE_DIR)
         os.symlink(profile_dir, CLAUDE_DIR)
@@ -160,9 +185,10 @@ def switch_profile(name):
         state["message_style"] = "error"
         return False
 
-def add_profile(name):
-    """Create a new profile folder."""
+def add_profile(name, share=False):
+    """Create a new profile folder, optionally joining the shared pool."""
     name = "".join([c for c in name if c.isalnum() or c in ("-", "_")]).strip()
+    name = name.lstrip("_")  # "_" is reserved for internals
     if not name:
         state["message"] = "Invalid profile name."
         state["message_style"] = "error"
@@ -176,8 +202,11 @@ def add_profile(name):
 
     try:
         os.makedirs(profile_dir, exist_ok=True)
+        if share:
+            sharing.enable_sharing(PROFILES_DIR, name)
         switch_profile(name)
-        state["message"] = f"Created and activated profile '{name}'."
+        where = "sharing data" if share else "with its own data"
+        state["message"] = f"Created and activated profile '{name}' ({where})."
         state["message_style"] = "success"
         return True
     except Exception as e:
@@ -225,6 +254,7 @@ app_style = Style.from_dict({
     "border": "fg:#444444",
     "active": "fg:#00ff00 bold",
     "inactive": "fg:#8a8a8a",
+    "shared": "fg:#00afaf",
     "selected": "bg:#3a3a3a fg:#ffffff bold",
     "active-selected": "bg:#3a3a3a fg:#00ff00 bold",
     "info": "fg:#00afff",
@@ -271,11 +301,23 @@ def do_add(event):
             print("\n" * 2)
             print("=== ADD NEW PROFILE ===")
             name = input("Enter new profile name: ").strip()
-            if name:
-                add_profile(name)
-            else:
+            if not name:
                 state["message"] = "Profile creation cancelled."
                 state["message_style"] = "info"
+                time.sleep(1.2)
+                return
+
+            # A new profile is as often "another one of mine" as it is "a
+            # client account, keep it separate", so ask rather than assume.
+            share = False
+            pool = sharing.pool_summary(PROFILES_DIR)
+            if pool is not None:
+                print(f"\nA shared pool exists ({pool['conversations']} conversations, "
+                      f"{sharing.human_size(pool['bytes'])}).")
+                print("Sharing gives the new profile those conversations, memory and")
+                print("settings. Its login stays separate either way.")
+                share = input(f"Share data with the pool? (y/N): ").strip().lower() == "y"
+            add_profile(name, share=share)
             time.sleep(1.2)
 
         await run_in_terminal(prompt_add)
@@ -309,6 +351,118 @@ def do_remove(event):
 
     import asyncio
     asyncio.create_task(remove_flow())
+
+def enable_sharing_flow(selected, ask=input, say=print):
+    """Ask, then move `selected` into the shared pool. Returns True if it did.
+
+    `ask` and `say` are injected so the whole dialogue can be driven by tests
+    without a terminal.
+    """
+    pool = sharing.pool_summary(PROFILES_DIR)
+    say(f"=== SHARE DATA: {selected} ===\n")
+    if pool is None:
+        say("No shared pool exists yet.")
+        say(f"'{selected}' will become the pool: its conversations, memory,")
+        say("settings and skills stay exactly as they are, and any other")
+        say("profile you share later will see them.")
+    else:
+        # The pool outlives its last member by design, so it can exist with
+        # nobody in it.
+        others = [p for p in state["profiles"]
+                  if p != selected and state["sharing"].get(p)]
+        used_by = f"used by {', '.join(others)}" if others else \
+            "currently used by no profile"
+        say(f"Shared pool: {pool['conversations']} conversations, "
+            f"{sharing.human_size(pool['bytes'])}, {used_by}.")
+        say(f"\n'{selected}' will join it, bringing its own data in:")
+        say("  - conversations, memory and snapshots merge (names never collide)")
+        say("  - a settings file that disagrees with the pool's is kept aside")
+        say("    in an _archive folder, never deleted")
+    say("\nCredentials and account identity are NOT shared.\n")
+
+    if ask(f"Share data for '{selected}'? (y/N): ").strip().lower() != "y":
+        state["message"] = "Sharing unchanged."
+        state["message_style"] = "info"
+        return False
+
+    result = sharing.enable_sharing(PROFILES_DIR, selected)
+    if selected == state["active_profile"]:
+        switch_profile(selected)  # refresh the symlinks in place
+
+    parts = ["seeded the pool"] if result["seeded"] else []
+    if result["merged"]:
+        parts.append(f"{result['merged']} file(s) merged")
+    if result["archived"]:
+        parts.append(f"{result['archived']} kept in {os.path.basename(result['archive'])}")
+    if result["withheld"]:
+        parts.append(f"{len(result['withheld'])} account key(s) withheld")
+    state["message"] = f"'{selected}' now shares data" + (
+        " (" + ", ".join(parts) + ")." if parts else ".")
+    state["message_style"] = "success"
+    return True
+
+
+def disable_sharing_flow(selected, ask=input, say=print):
+    """Ask what to keep, then take `selected` out of the pool."""
+    pool = sharing.pool_summary(PROFILES_DIR)
+    size = sharing.human_size(pool["bytes"]) if pool else "0 B"
+    count = pool["conversations"] if pool else 0
+    say(f"=== STOP SHARING: {selected} ===\n")
+    say(f"'{selected}' currently reads {count} conversation(s) from the")
+    say(f"shared pool ({size}). What should it keep?\n")
+    say(f"  [k] Keep a copy  - fork the pool into '{selected}' and diverge")
+    say(f"                     from there (uses another {size} on disk)")
+    say(f"  [e] Start empty  - '{selected}' begins with no conversations")
+    say( "  [c] Cancel\n")
+    say("Either way the pool itself is untouched, and other profiles")
+    say("keep reading it normally.\n")
+
+    choice = ask("Choice [k/e/c]: ").strip().lower()
+    if choice not in ("k", "e"):
+        state["message"] = "Sharing unchanged."
+        state["message_style"] = "info"
+        return False
+
+    result = sharing.disable_sharing(PROFILES_DIR, selected, take_copy=(choice == "k"))
+    if selected == state["active_profile"]:
+        switch_profile(selected)
+    if choice == "k":
+        state["message"] = (f"'{selected}' is isolated with its own copy "
+                            f"({result['copied']} file(s)).")
+    else:
+        state["message"] = f"'{selected}' is isolated and starts empty."
+    state["message_style"] = "success"
+    return True
+
+
+@kb.add("s")
+def do_toggle_sharing(event):
+    """Move the selected profile in or out of the shared data pool."""
+    if not state["profiles"]:
+        return
+
+    selected = state["profiles"][state["selected_index"]]
+    currently_shared = state["sharing"].get(selected, False)
+
+    async def toggle_flow():
+        def run():
+            print("\n" * 2)
+            try:
+                if currently_shared:
+                    disable_sharing_flow(selected)
+                else:
+                    enable_sharing_flow(selected)
+            except Exception as exc:
+                state["message"] = f"Sharing failed: {exc}"
+                state["message_style"] = "error"
+            time.sleep(1.2)
+
+        await run_in_terminal(run)
+        refresh_profiles()
+        event.app.invalidate()
+
+    import asyncio
+    asyncio.create_task(toggle_flow())
 
 @kb.add("c")
 def do_change_command(event):
@@ -393,14 +547,14 @@ def get_screen_text():
     tokens.append(("", "\n"))
 
     # Profile List Table
-    tokens.append(("class:border", " ┌──────────────────────────────┬───────────────┐\n"))
-    tokens.append(("class:border", " │ Profile Name                 │ Status        │\n"))
-    tokens.append(("class:border", " ├──────────────────────────────┼───────────────┤\n"))
+    tokens.append(("class:border", " ┌──────────────────────────────┬───────────────┬──────────────┐\n"))
+    tokens.append(("class:border", " │ Profile Name                 │ Status        │ Data         │\n"))
+    tokens.append(("class:border", " ├──────────────────────────────┼───────────────┼──────────────┤\n"))
 
     if not state["profiles"]:
         tokens.append(("class:border", " │ "))
         tokens.append(("class:error", "No profiles found.           "))
-        tokens.append(("class:border", " │               │\n"))
+        tokens.append(("class:border", " │               │              │\n"))
     else:
         for idx, name in enumerate(state["profiles"]):
             is_selected = (idx == state["selected_index"])
@@ -424,14 +578,27 @@ def get_screen_text():
                 status_style = "class:inactive"
 
             status_text = "● ACTIVE" if is_active else "  inactive"
+            is_sharing = state["sharing"].get(name, False)
+            data_text = "⇄ shared" if is_sharing else "⊘ isolated"
+            data_style = row_style if is_selected else (
+                "class:shared" if is_sharing else "class:inactive")
 
             tokens.append(("class:border", " │ "))
             tokens.append((row_style, f"{name:<28}"))
             tokens.append(("class:border", " │ "))
             tokens.append((status_style, f"{status_text:<13}"))
+            tokens.append(("class:border", " │ "))
+            tokens.append((data_style, f"{data_text:<12}"))
             tokens.append(("class:border", " │\n"))
 
-    tokens.append(("class:border", " └──────────────────────────────┴───────────────┘\n"))
+    tokens.append(("class:border", " └──────────────────────────────┴───────────────┴──────────────┘\n"))
+
+    if state["pool"]:
+        shared_count = sum(1 for v in state["sharing"].values() if v)
+        tokens.append(("class:subtitle",
+                       f" Shared pool: {state['pool']['conversations']} conversations, "
+                       f"{sharing.human_size(state['pool']['bytes'])}, "
+                       f"{shared_count} profile(s)\n"))
     tokens.append(("", "\n"))
 
     # Message Bar
@@ -449,6 +616,8 @@ def get_screen_text():
     tokens.append(("class:help-desc", " Remove  "))
     tokens.append(("class:help-key", " [L]"))
     tokens.append(("class:help-desc", " Login  "))
+    tokens.append(("class:help-key", " [S]"))
+    tokens.append(("class:help-desc", " Share Data  "))
     tokens.append(("class:help-key", " [C]"))
     tokens.append(("class:help-desc", " Set Command  "))
     tokens.append(("class:help-key", " [Q]"))
