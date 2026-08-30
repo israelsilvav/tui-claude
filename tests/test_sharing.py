@@ -404,3 +404,48 @@ def test_repair_is_idempotent(profiles_dir):
 
     assert sharing.repair_sharing(profiles_dir, "trabalho") == []
     assert sharing.repair_sharing(profiles_dir, "trabalho") == []
+
+
+# --- concurrency ------------------------------------------------------------
+
+def _hold_lock_and_increment(profiles_dir, path):
+    """Read, pause, write — the shape that loses updates without a lock."""
+    import time as _time
+    from tui_claude import sharing as _sharing
+    with _sharing.pool_lock(profiles_dir):
+        data = _sharing.load_json(path)
+        data["count"] = data.get("count", 0) + 1
+        _time.sleep(0.15)
+        _sharing.save_json(path, data)
+
+
+def test_pool_lock_serialises_two_processes(profiles_dir, tmp_path):
+    import multiprocessing
+
+    os.makedirs(sharing.pool_dir(profiles_dir), exist_ok=True)
+    counter = str(tmp_path / "counter.json")
+    sharing.save_json(counter, {"count": 0})
+
+    workers = [multiprocessing.Process(target=_hold_lock_and_increment,
+                                       args=(profiles_dir, counter))
+               for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert sharing.load_json(counter)["count"] == 2, \
+        "without the lock the second write would clobber the first"
+
+
+def test_split_takes_the_lock_without_deadlocking(profiles_dir):
+    """The lock is held across the whole read-merge-write of the pool config."""
+    make_profile(profiles_dir, "trabalho", "t@example.com", config={"flag": 1})
+    sharing.enable_sharing(profiles_dir, "trabalho")
+
+    sharing.split_claude_json(profiles_dir, "trabalho")
+    sharing.split_claude_json(profiles_dir, "trabalho")
+
+    pool_config = json.load(open(os.path.join(sharing.pool_dir(profiles_dir),
+                                              "claude.shared.json")))
+    assert pool_config["flag"] == 1

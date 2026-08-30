@@ -20,10 +20,12 @@ Layout, with `trabalho` and `pessoal` sharing and `cliente-x` isolated:
         cliente-x/
             projects/               <- real directory, sees none of the above
 
-Whether a profile shares is read from the filesystem itself (is `projects` a
-symlink into the pool?), so there is no config file to drift out of sync.
+Whether a profile shares is read from the filesystem itself (does anything in
+it point into the pool?), so there is no config file to drift out of sync.
 """
 
+import contextlib
+import fcntl
 import json
 import os
 import shutil
@@ -137,6 +139,25 @@ def save_json(path, data):
 
 def pool_dir(profiles_dir):
     return os.path.join(profiles_dir, POOL_NAME)
+
+
+@contextlib.contextmanager
+def pool_lock(profiles_dir):
+    """Serialise read-modify-write on the pool's shared config.
+
+    save_json is already atomic, so an unlocked write cannot corrupt the file
+    — but two TUIs that read, merge and write around each other would drop one
+    of the two updates. This closes that window.
+    """
+    pool = pool_dir(profiles_dir)
+    os.makedirs(pool, exist_ok=True)
+    handle = os.open(os.path.join(pool, ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        os.close(handle)
 
 
 def pool_exists(profiles_dir):
@@ -304,32 +325,36 @@ def split_claude_json(profiles_dir, profile):
     baseline_path = os.path.join(profile_path, "claude.baseline.json")
 
     account = {k: v for k, v in data.items() if is_account_key(k)}
-    shared = load_json(shared_path)
     already_local = load_json(account_path)
     marks = identity_markers(account)
 
-    common, withheld = {}, []
-    for key, value in data.items():
-        if is_account_key(key):
-            continue
-        # A key the pool has never seen that carries this account's identity
-        # stays behind. Restricting it to new keys matters: an email can appear
-        # inside `projects` (someone typed it in a prompt), and hijacking that
-        # whole key would break the sharing it is supposed to protect.
-        if key not in shared and carries_identity(value, marks):
-            account[key] = value
-            if key not in already_local:
-                withheld.append(key)
+    with pool_lock(profiles_dir):
+        shared = load_json(shared_path)
+
+        common, withheld = {}, []
+        for key, value in data.items():
+            if is_account_key(key):
+                continue
+            # A key the pool has never seen that carries this account's
+            # identity stays behind. Restricting it to new keys matters: an
+            # email can appear inside `projects` (someone typed it in a
+            # prompt), and hijacking that whole key would break the sharing it
+            # is supposed to protect.
+            if key not in shared and carries_identity(value, marks):
+                account[key] = value
+                if key not in already_local:
+                    withheld.append(key)
+            else:
+                common[key] = value
+
+        if os.path.exists(baseline_path):
+            sets, deletes = compute_delta(load_json(baseline_path), common)
+            shared = apply_delta(shared, sets, deletes)
         else:
-            common[key] = value
+            shared.update(common)  # first time: nothing to diff against
 
-    if os.path.exists(baseline_path):
-        sets, deletes = compute_delta(load_json(baseline_path), common)
-        shared = apply_delta(shared, sets, deletes)
-    else:
-        shared.update(common)  # first time: nothing to diff against
+        save_json(shared_path, shared)
 
-    save_json(shared_path, shared)
     save_json(account_path, account)
     save_json(baseline_path, common)
     return withheld
