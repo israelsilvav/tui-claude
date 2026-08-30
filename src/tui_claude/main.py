@@ -214,6 +214,58 @@ def add_profile(name, share=False):
         state["message_style"] = "error"
         return False
 
+def rename_profile(old, new):
+    """Rename a profile, keeping it active and shared if it was.
+
+    The symlinks inside a shared profile point into the pool by absolute path,
+    so they survive the rename untouched. Only the two symlinks that select the
+    active profile have to be re-pointed.
+    """
+    new = "".join([c for c in new if c.isalnum() or c in ("-", "_")]).strip()
+    new = new.lstrip("_")  # "_" is reserved for internals
+    if not new:
+        state["message"] = "Invalid profile name."
+        state["message_style"] = "error"
+        return False
+    if new == old:
+        state["message"] = "Name unchanged."
+        state["message_style"] = "info"
+        return False
+
+    old_dir = os.path.join(PROFILES_DIR, old)
+    new_dir = os.path.join(PROFILES_DIR, new)
+    if not os.path.isdir(old_dir):
+        state["message"] = f"Profile '{old}' does not exist."
+        state["message_style"] = "error"
+        return False
+    if os.path.lexists(new_dir):
+        state["message"] = f"Profile '{new}' already exists."
+        state["message_style"] = "error"
+        return False
+
+    try:
+        was_active = (state["active_profile"] == old)
+        os.rename(old_dir, new_dir)
+
+        if was_active:
+            # Re-point directly rather than calling switch_profile: the profile
+            # it would treat as "leaving" no longer exists under that name.
+            if os.path.lexists(CLAUDE_DIR):
+                os.unlink(CLAUDE_DIR)
+            os.symlink(new_dir, CLAUDE_DIR)
+            if os.path.lexists(CLAUDE_JSON):
+                os.unlink(CLAUDE_JSON)
+            os.symlink(os.path.join(new_dir, "claude.json"), CLAUDE_JSON)
+            state["active_profile"] = new
+
+        state["message"] = f"Renamed '{old}' to '{new}'."
+        state["message_style"] = "success"
+        return True
+    except Exception as e:
+        state["message"] = f"Failed to rename profile: {e}"
+        state["message_style"] = "error"
+        return False
+
 def delete_profile(name):
     """Remove a profile and fallback to another if active."""
     profile_dir = os.path.join(PROFILES_DIR, name)
@@ -327,30 +379,76 @@ def do_add(event):
     import asyncio
     asyncio.create_task(add_flow())
 
-@kb.add("r")
-def do_remove(event):
+def rename_flow(selected, ask=input, say=print):
+    """Ask for a new name and apply it. Returns True if the profile moved."""
+    say(f"=== RENAME PROFILE: {selected} ===\n")
+    say("The account, conversations and settings all stay with the profile;")
+    say("only its name changes.\n")
+    new = ask(f"New name for '{selected}' (blank cancels): ").strip()
+    if not new:
+        state["message"] = "Rename cancelled."
+        state["message_style"] = "info"
+        return False
+    return rename_profile(selected, new)
+
+
+def remove_flow(selected, ask=input, say=print):
+    """Confirm a deletion, spelling out what is lost. Returns True if removed."""
+    say(f"=== REMOVE PROFILE: {selected} ===\n")
+    say(f"This deletes the credentials and settings of '{selected}'.")
+    if sharing.is_shared(PROFILES_DIR, selected):
+        pool = sharing.pool_summary(PROFILES_DIR)
+        count = pool["conversations"] if pool else 0
+        say(f"Its {count} conversation(s) live in the shared pool and stay there,")
+        say("along with any other profile using it.")
+    else:
+        own = os.path.join(PROFILES_DIR, selected, "projects")
+        count = sum(len([f for f in files if f.endswith(".jsonl")])
+                    for _, _, files in os.walk(own))
+        say(f"This profile is isolated, so its {count} conversation(s) go with it.")
+    say(f"\nTo rename it instead, cancel and press [N].\n")
+
+    confirm = ask(f"Type 'y' to remove '{selected}', anything else cancels: ").strip().lower()
+    if confirm != "y":
+        state["message"] = "Profile removal cancelled."
+        state["message_style"] = "info"
+        return False
+    return delete_profile(selected)
+
+
+def _run_profile_flow(event, flow):
+    """Drive one of the prompt flows above in the terminal, then redraw."""
     if not state["profiles"]:
         return
-
     selected = state["profiles"][state["selected_index"]]
-    async def remove_flow():
-        def prompt_remove():
+
+    async def run_flow():
+        def run():
             print("\n" * 2)
-            print(f"=== REMOVE PROFILE: {selected} ===")
-            confirm = input(f"Are you sure you want to remove '{selected}'? (y/N): ").strip().lower()
-            if confirm == "y":
-                delete_profile(selected)
-            else:
-                state["message"] = "Profile removal cancelled."
-                state["message_style"] = "info"
+            try:
+                flow(selected)
+            except Exception as exc:
+                state["message"] = f"Failed: {exc}"
+                state["message_style"] = "error"
             time.sleep(1.2)
 
-        await run_in_terminal(prompt_remove)
+        await run_in_terminal(run)
         refresh_profiles()
         event.app.invalidate()
 
     import asyncio
-    asyncio.create_task(remove_flow())
+    asyncio.create_task(run_flow())
+
+
+@kb.add("n")
+@kb.add("f2")
+def do_rename(event):
+    _run_profile_flow(event, rename_flow)
+
+
+@kb.add("r")
+def do_remove(event):
+    _run_profile_flow(event, remove_flow)
 
 def enable_sharing_flow(selected, ask=input, say=print):
     """Ask, then move `selected` into the shared pool. Returns True if it did.
@@ -612,6 +710,8 @@ def get_screen_text():
     tokens.append(("class:help-desc", " Switch Profile  "))
     tokens.append(("class:help-key", " [A]"))
     tokens.append(("class:help-desc", " Add  "))
+    tokens.append(("class:help-key", " [N]"))
+    tokens.append(("class:help-desc", " Rename  "))
     tokens.append(("class:help-key", " [R]"))
     tokens.append(("class:help-desc", " Remove  "))
     tokens.append(("class:help-key", " [L]"))

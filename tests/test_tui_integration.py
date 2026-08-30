@@ -315,3 +315,153 @@ def test_enable_dialogue_handles_a_pool_with_no_members(tui):
 
     assert "used by ." not in term.screen
     assert "used by no profile" in term.screen
+
+
+# --- renaming ---------------------------------------------------------------
+
+def test_rename_moves_the_profile(tui):
+    tui.add_profile("old-name")
+    tui.refresh_profiles()
+
+    assert tui.rename_profile("old-name", "new-name") is True
+
+    tui.refresh_profiles()
+    assert "new-name" in tui.state["profiles"]
+    assert "old-name" not in tui.state["profiles"]
+
+
+def test_renaming_the_active_profile_keeps_it_active(tui):
+    tui.add_profile("work")
+    tui.switch_profile("work")
+    tui.refresh_profiles()
+
+    tui.rename_profile("work", "employer")
+
+    tui.refresh_profiles()
+    assert tui.state["active_profile"] == "employer"
+    assert os.path.realpath(tui.CLAUDE_DIR) == \
+        os.path.realpath(os.path.join(tui.PROFILES_DIR, "employer"))
+    assert os.readlink(tui.CLAUDE_JSON) == \
+        os.path.join(tui.PROFILES_DIR, "employer", "claude.json")
+
+
+def test_renaming_keeps_the_account_and_conversations(tui):
+    tui.add_profile("work")
+    config_path = os.path.join(tui.PROFILES_DIR, "work", "claude.json")
+    with open(config_path, "w") as handle:
+        json.dump({"oauthAccount": {"emailAddress": "me@example.com"}}, handle)
+    projects = os.path.join(tui.PROFILES_DIR, "work", "projects", "-home-user")
+    os.makedirs(projects)
+    open(os.path.join(projects, "conversation.jsonl"), "w").write("{}")
+    tui.switch_profile("work")
+    tui.refresh_profiles()
+
+    tui.rename_profile("work", "employer")
+
+    moved = os.path.join(tui.PROFILES_DIR, "employer")
+    assert json.load(open(os.path.join(moved, "claude.json")))["oauthAccount"]["emailAddress"] \
+        == "me@example.com"
+    assert os.path.exists(os.path.join(moved, "projects", "-home-user",
+                                       "conversation.jsonl"))
+
+
+def test_renaming_a_shared_profile_keeps_it_shared(tui):
+    """The links inside a shared profile point into the pool by absolute path,
+    so they must survive the directory moving."""
+    tui.add_profile("work")
+    sharing.enable_sharing(tui.PROFILES_DIR, "work")
+    projects = os.path.join(sharing.pool_dir(tui.PROFILES_DIR), "projects")
+    os.makedirs(projects, exist_ok=True)
+    open(os.path.join(projects, "conversation.jsonl"), "w").write("{}")
+    tui.refresh_profiles()
+
+    tui.rename_profile("work", "employer")
+
+    tui.refresh_profiles()
+    assert tui.state["sharing"]["employer"] is True
+    listing = os.listdir(os.path.join(tui.PROFILES_DIR, "employer", "projects"))
+    assert "conversation.jsonl" in listing
+
+
+def test_rename_rejects_a_name_already_taken(tui):
+    tui.add_profile("one")
+    tui.add_profile("two")
+    tui.refresh_profiles()
+
+    assert tui.rename_profile("one", "two") is False
+
+    tui.refresh_profiles()
+    assert {"one", "two"} <= set(tui.state["profiles"])
+    assert "already exists" in tui.state["message"]
+
+
+def test_rename_rejects_the_reserved_prefix(tui):
+    tui.add_profile("work")
+    tui.refresh_profiles()
+
+    tui.rename_profile("work", "_shared")
+
+    tui.refresh_profiles()
+    assert "shared" in tui.state["profiles"], "the underscore is stripped"
+    assert "_shared" not in tui.state["profiles"]
+
+
+def test_rename_flow_cancels_on_a_blank_name(tui):
+    tui.add_profile("work")
+    tui.refresh_profiles()
+
+    assert tui.rename_flow("work", FakeTerminal("").ask, lambda *a: None) is False
+
+    tui.refresh_profiles()
+    assert "work" in tui.state["profiles"]
+    assert tui.state["message"] == "Rename cancelled."
+
+
+def test_rename_flow_applies_the_typed_name(tui):
+    tui.add_profile("work")
+    tui.refresh_profiles()
+    term = FakeTerminal("employer")
+
+    assert tui.rename_flow("work", term.ask, term.say) is True
+
+    assert "only its name changes" in term.screen
+    tui.refresh_profiles()
+    assert "employer" in tui.state["profiles"]
+
+
+def test_remove_dialogue_points_at_rename(tui):
+    """The mistake this guards against: pressing [R] meaning to rename, then
+    typing the new name into the y/N prompt."""
+    tui.add_profile("work")
+    tui.refresh_profiles()
+    term = FakeTerminal("v360")          # a name, not a confirmation
+
+    assert tui.remove_flow("work", term.ask, term.say) is False
+
+    assert "press [N]" in term.screen, "the dialogue offers the way out"
+    tui.refresh_profiles()
+    assert "work" in tui.state["profiles"], "anything but 'y' cancels"
+
+
+def test_remove_dialogue_says_what_is_lost(tui):
+    tui.add_profile("isolated-one")
+    projects = os.path.join(tui.PROFILES_DIR, "isolated-one", "projects", "-home-user")
+    os.makedirs(projects)
+    open(os.path.join(projects, "conversation.jsonl"), "w").write("{}")
+    tui.refresh_profiles()
+    term = FakeTerminal("n")
+
+    tui.remove_flow("isolated-one", term.ask, term.say)
+
+    assert "isolated" in term.screen and "1 conversation(s) go with it" in term.screen
+
+
+def test_remove_dialogue_reassures_when_shared(tui):
+    tui.add_profile("work")
+    sharing.enable_sharing(tui.PROFILES_DIR, "work")
+    tui.refresh_profiles()
+    term = FakeTerminal("n")
+
+    tui.remove_flow("work", term.ask, term.say)
+
+    assert "stay there" in term.screen, "shared conversations are not at risk"
