@@ -5,6 +5,7 @@ import shutil
 import pytest
 
 from tui_claude import sharing
+from tui_claude.links import points_to
 
 
 # --- fixtures ----------------------------------------------------------------
@@ -369,7 +370,7 @@ def test_atomic_write_that_breaks_a_symlink_is_repaired(profiles_dir):
     repaired = sharing.repair_sharing(profiles_dir, "work")
 
     assert "settings.json" in repaired
-    assert os.path.islink(link)
+    assert points_to(link, os.path.join(sharing.pool_dir(profiles_dir), "settings.json"))
     # the newer content won and reached the other profile through the pool
     other = os.path.join(profiles_dir, "personal", "settings.json")
     assert json.load(open(other))["theme"] == "light"
@@ -460,7 +461,9 @@ def test_file_absent_on_both_sides_is_still_linked(profiles_dir):
     sharing.enable_sharing(profiles_dir, "work")
 
     link = os.path.join(profiles_dir, "work", "settings.json")
-    assert os.path.islink(link), "a symlink may dangle; that is fine"
+    pool_file = os.path.join(sharing.pool_dir(profiles_dir), "settings.json")
+    # A symlink may dangle; a Windows hardlink needs the pool file to exist.
+    assert os.path.islink(link) or points_to(link, pool_file)
 
     # writing through the dangling link creates the file inside the pool
     json.dump({"theme": "dark"}, open(link, "w"))
@@ -514,4 +517,4 @@ def test_repair_promotes_when_the_profile_is_newer(profiles_dir):
     sharing.repair_sharing(profiles_dir, "work")
 
     assert json.load(open(pool_file))["theme"] == "fresher"
-    assert os.path.islink(link)
+    assert points_to(link, pool_file)

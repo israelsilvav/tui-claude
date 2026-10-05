@@ -45,6 +45,19 @@ To get a `tui-claude` command on your `PATH`:
 uv tool install .
 ```
 
+### Windows
+
+Works on Windows 10/11 with no administrator rights and no Developer Mode. Windows does not let a normal user create symlinks, so the links are made differently:
+
+| Item | Linux / macOS | Windows |
+|------|---------------|---------|
+| `~/.claude` and shared directories | symlink | junction |
+| Shared files (`settings.json`, `history.jsonl`, `CLAUDE.md`) | symlink | symlink in Developer Mode, otherwise hardlink |
+| `~/.claude.json` | symlink | real file, copied out of and into the profile on every switch |
+
+> [!IMPORTANT]
+> Close **every** Claude Code session (terminal, IDE extension, desktop app) before the first run. Windows cannot move `~/.claude` while a file in it is open; `tui-claude` then stops with an error and leaves `~/.claude` untouched instead of moving half of it.
+
 ## Usage
 
 ```bash

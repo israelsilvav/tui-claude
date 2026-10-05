@@ -25,11 +25,17 @@ it point into the pool?), so there is no config file to drift out of sync.
 """
 
 import contextlib
-import fcntl
 import json
 import os
 import shutil
 import time
+
+from .links import IS_WINDOWS, is_link, link_dir, link_file, points_to
+
+if IS_WINDOWS:
+    import msvcrt
+else:
+    import fcntl
 
 # Reserved directory inside PROFILES_DIR; refresh_profiles() must skip "_*".
 POOL_NAME = "_shared"
@@ -124,7 +130,9 @@ def carries_identity(value, marks):
 
 def load_json(path):
     try:
-        with open(path) as handle:
+        # Explicit: Windows defaults to cp1252, and a decode error here would be
+        # swallowed below and returned as {} — then written back over the file.
+        with open(path, encoding="utf-8") as handle:
             return json.load(handle)
     except (OSError, ValueError):
         return {}
@@ -132,7 +140,7 @@ def load_json(path):
 
 def save_json(path, data):
     tmp = path + ".tmp"
-    with open(tmp, "w") as handle:
+    with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
     os.replace(tmp, path)
 
@@ -153,11 +161,34 @@ def pool_lock(profiles_dir):
     os.makedirs(pool, exist_ok=True)
     handle = os.open(os.path.join(pool, ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        _lock(handle)
         yield
     finally:
-        fcntl.flock(handle, fcntl.LOCK_UN)
+        _unlock(handle)
         os.close(handle)
+
+
+def _lock(fd):
+    if IS_WINDOWS:
+        # Locks a byte range, not the file; always the first byte. LK_LOCK
+        # gives up after ten one-second retries, so keep retrying ourselves.
+        os.lseek(fd, 0, os.SEEK_SET)
+        while True:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                return
+            except OSError:
+                time.sleep(0.1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+
+def _unlock(fd):
+    if IS_WINDOWS:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 def pool_exists(profiles_dir):
@@ -174,9 +205,7 @@ def is_shared(profiles_dir, profile):
     profile_path = os.path.join(profiles_dir, profile)
     pool = pool_dir(profiles_dir)
     for name in SHARED_DIRS + SHARED_FILES:
-        link = os.path.join(profile_path, name)
-        if os.path.islink(link) and \
-                os.path.realpath(link) == os.path.realpath(os.path.join(pool, name)):
+        if points_to(os.path.join(profile_path, name), os.path.join(pool, name)):
             return True
     return False
 
@@ -189,6 +218,8 @@ def dir_size(path):
     """Bytes under `path`, not following symlinks."""
     total = 0
     for root, dirs, files in os.walk(path, followlinks=False):
+        # os.walk descends into junctions even with followlinks=False.
+        dirs[:] = [d for d in dirs if not is_link(os.path.join(root, d))]
         for name in files:
             full = os.path.join(root, name)
             if not os.path.islink(full):
@@ -255,12 +286,12 @@ def merge_history(src, dst):
     for path in (dst, src):
         if not os.path.exists(path):
             continue
-        with open(path) as handle:
+        with open(path, encoding="utf-8") as handle:
             for line in handle:
                 if line.strip() and line not in seen:
                     seen.add(line)
                     out.append(line)
-    with open(dst, "w") as handle:
+    with open(dst, "w", encoding="utf-8") as handle:
         handle.writelines(out)
 
 
@@ -397,7 +428,7 @@ def enable_sharing(profiles_dir, profile):
     for name in SHARED_DIRS:
         local = os.path.join(profile_path, name)
         target = os.path.join(pool, name)
-        if os.path.islink(local):
+        if is_link(local):
             os.unlink(local)
         elif os.path.isdir(local):
             if not os.path.exists(target):
@@ -408,12 +439,12 @@ def enable_sharing(profiles_dir, profile):
                 archived += lost
                 shutil.rmtree(local)
         os.makedirs(target, exist_ok=True)
-        os.symlink(target, local)
+        link_dir(target, local)
 
     for name in SHARED_FILES:
         local = os.path.join(profile_path, name)
         target = os.path.join(pool, name)
-        if os.path.islink(local):
+        if is_link(local) or points_to(local, target):
             os.unlink(local)
         elif os.path.isfile(local):
             if not os.path.exists(target):
@@ -432,7 +463,7 @@ def enable_sharing(profiles_dir, profile):
         # a target that does not exist, and writing through it creates the
         # target inside the pool. Without this, the first settings.json the app
         # writes would land in the profile and quietly escape sharing.
-        os.symlink(target, local)
+        link_file(target, local)
 
     withheld = split_claude_json(profiles_dir, profile)
     return {"seeded": seeded, "merged": merged, "archived": archived,
@@ -459,7 +490,7 @@ def disable_sharing(profiles_dir, profile, take_copy):
     for name in SHARED_DIRS:
         local = os.path.join(profile_path, name)
         source = os.path.join(pool, name)
-        if os.path.islink(local):
+        if is_link(local):
             os.unlink(local)
         if take_copy and os.path.isdir(source):
             shutil.copytree(source, local, symlinks=True)
@@ -470,7 +501,7 @@ def disable_sharing(profiles_dir, profile, take_copy):
     for name in SHARED_FILES:
         local = os.path.join(profile_path, name)
         source = os.path.join(pool, name)
-        if os.path.islink(local):
+        if is_link(local) or points_to(local, source):
             os.unlink(local)
         if take_copy and os.path.isfile(source):
             shutil.copy2(source, local)
@@ -498,7 +529,7 @@ def repair_sharing(profiles_dir, profile):
     for name in SHARED_DIRS + SHARED_FILES:
         local = os.path.join(profile_path, name)
         target = os.path.join(pool, name)
-        if os.path.islink(local) or not os.path.exists(local):
+        if is_link(local) or points_to(local, target) or not os.path.exists(local):
             continue
 
         if os.path.isdir(local):
@@ -525,7 +556,7 @@ def repair_sharing(profiles_dir, profile):
         if name in SHARED_DIRS:
             os.makedirs(target, exist_ok=True)
         if os.path.exists(target):
-            os.symlink(target, local)
+            (link_dir if name in SHARED_DIRS else link_file)(target, local)
             repaired.append(name)
 
     return repaired
