@@ -133,7 +133,7 @@ def test_migration_refuses_while_a_file_is_open(tmp_path, monkeypatch):
                 def invalidate():
                     pass
 
-        for handler in (main.do_switch, main.do_add, main.do_remove,
+        for handler in (main.do_switch, main.do_add, main.do_remove, main.do_rename,
                         main.do_toggle_sharing, main.do_login):
             main.state["message"] = ""
             handler(Event)
@@ -142,6 +142,31 @@ def test_migration_refuses_while_a_file_is_open(tmp_path, monkeypatch):
     finally:
         monkeypatch.delenv("TUI_CLAUDE_TEST_DIR")
         importlib.reload(main)
+
+
+@windows_only
+def test_renaming_the_active_shared_profile_keeps_live_config_and_pool(tui):
+    tui.add_profile("work")
+    sharing.enable_sharing(tui.PROFILES_DIR, "work")
+    tui.switch_profile("work")
+    pool_projects = os.path.join(sharing.pool_dir(tui.PROFILES_DIR), "projects")
+    open(os.path.join(pool_projects, "conv.jsonl"), "w").write("{}")
+    # Claude Code wrote to the live file; the profile's copy is stale.
+    write_json(tui.CLAUDE_JSON, {"oauthAccount": {"emailAddress": "w@example.net"},
+                                 "numStartups": 3})
+    tui.refresh_profiles()
+
+    assert tui.rename_profile("work", "employer") is True
+    tui.refresh_profiles()
+
+    employer = os.path.join(tui.PROFILES_DIR, "employer")
+    assert tui.state["active_profile"] == "employer"
+    assert os.path.isjunction(tui.CLAUDE_DIR)
+    assert read_link(tui.CLAUDE_DIR) == employer
+    assert read_json(os.path.join(employer, "claude.json"))["numStartups"] == 3
+    assert read_json(tui.CLAUDE_JSON)["numStartups"] == 3
+    assert tui.state["sharing"]["employer"] is True
+    assert os.path.exists(os.path.join(tui.CLAUDE_DIR, "projects", "conv.jsonl"))
 
 
 @windows_only

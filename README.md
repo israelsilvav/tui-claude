@@ -23,7 +23,7 @@ Claude Code keeps everything for one account in `~/.claude` — credentials, con
  └──────────────────────────────┴───────────────┴──────────────┘
  Shared pool: 7 conversations, 5.5 KB, 2 profile(s)
 
- [Enter] Switch Profile   [A] Add   [R] Remove   [L] Login   [S] Share Data   [C] Set Command   [Q] Quit
+ [Enter] Switch Profile   [A] Add   [N] Rename   [R] Remove   [L] Login   [S] Share Data   [C] Set Command   [Q] Quit
 ```
 
 ---
@@ -69,6 +69,7 @@ tui-claude
 | `↑` `↓` / `k` `j` | Move the selection |
 | `Enter` | Switch to the selected profile |
 | `A` | Create a profile |
+| `N` / `F2` | Rename a profile |
 | `R` | Delete a profile (asks first) |
 | `L` | Run the login command for the selected profile |
 | `S` | Share or isolate the selected profile's data |
@@ -81,6 +82,12 @@ If `~/.claude` is a real directory, it is moved to `~/.claude-profiles/default` 
 
 > [!WARNING]
 > If `~/.claude-profiles/default` **already exists** when `~/.claude` is still a real directory, the existing `~/.claude` is moved to `~/.claude-profiles/backup-existing-<timestamp>` instead, and the empty `default` takes its place. The active profile then looks blank and Claude Code asks you to log in again. Your data is in the backup directory, not gone — copy `projects/` out of it. This happens when a profile was created before the first migration ran.
+
+### Renaming
+
+`N` (or `F2`) renames the selected profile. The account, conversations and
+settings stay with it — only the name changes, and a profile that was active
+stays active. `R` is Remove, not Rename.
 
 ### Logging in
 
