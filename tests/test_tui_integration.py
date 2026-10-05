@@ -92,7 +92,9 @@ def test_switching_between_shared_profiles_carries_config(tui):
     tui.refresh_profiles()
 
     tui.switch_profile("a")
-    config_path = os.path.join(tui.PROFILES_DIR, "a", "claude.json")
+    # Write where Claude Code writes: the live file, a symlink on POSIX and a
+    # copy on Windows.
+    config_path = tui.CLAUDE_JSON
     config = json.load(open(config_path))
     config["tipsHistory"] = {"seen": 1}
     json.dump(config, open(config_path, "w"))
@@ -259,8 +261,11 @@ def test_toggling_the_active_profile_keeps_the_symlinks_valid(tui):
         os.path.realpath(os.path.join(tui.PROFILES_DIR, "work"))
     # A brand new profile has no claude.json until Claude Code writes one, so
     # assert where the link points, not that the target exists yet.
-    assert os.readlink(tui.CLAUDE_JSON) == \
-        os.path.join(tui.PROFILES_DIR, "work", "claude.json")
+    if tui.COPY_LIVE_JSON:
+        assert not os.path.exists(tui.CLAUDE_JSON), "nothing to copy in yet"
+    else:
+        assert os.readlink(tui.CLAUDE_JSON) == \
+            os.path.join(tui.PROFILES_DIR, "work", "claude.json")
     assert tui.state["sharing"]["work"] is True
 
 

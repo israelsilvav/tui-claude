@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import contextlib
 import os
 import shutil
 import time
@@ -12,6 +13,7 @@ from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.styles import Style
 
 from . import sharing
+from .links import IS_WINDOWS, is_link, link_dir, read_link, remove_link
 
 TEST_DIR = os.environ.get("TUI_CLAUDE_TEST_DIR")
 if TEST_DIR:
@@ -22,6 +24,12 @@ else:
     PROFILES_DIR = os.path.expanduser("~/.claude-profiles")
     CLAUDE_DIR = os.path.expanduser("~/.claude")
     CLAUDE_JSON = os.path.expanduser("~/.claude.json")
+
+# On Windows ~/.claude.json stays a real file and is copied in and out of the
+# profile on every switch. A file link there would not survive: Claude Code
+# rewrites the file atomically, turning the link back into a plain file that no
+# longer belongs to any profile. ~/.claude itself is a junction.
+COPY_LIVE_JSON = IS_WINDOWS
 
 # Global State
 state = {
@@ -47,7 +55,7 @@ def init_profiles():
 
     # Check if ~/.claude exists
     if os.path.lexists(CLAUDE_DIR):
-        if os.path.islink(CLAUDE_DIR):
+        if is_link(CLAUDE_DIR):
             # Already a symlink, check where it points
             pass
         else:
@@ -55,22 +63,26 @@ def init_profiles():
             default_dir = os.path.join(PROFILES_DIR, "default")
             try:
                 if not os.path.lexists(default_dir):
-                    shutil.move(CLAUDE_DIR, default_dir)
+                    move_claude_dir(default_dir)
                     state["message"] = "Migrated existing ~/.claude to 'default' profile"
                 else:
                     backup_dir = os.path.join(PROFILES_DIR, f"backup-existing-{int(time.time())}")
-                    shutil.move(CLAUDE_DIR, backup_dir)
+                    move_claude_dir(backup_dir)
                     state["message"] = f"Migrated existing ~/.claude to backup: {os.path.basename(backup_dir)}"
-                os.symlink(default_dir, CLAUDE_DIR)
+                link_dir(default_dir, CLAUDE_DIR)
             except Exception as e:
                 state["message"] = f"Failed to migrate ~/.claude: {e}"
                 state["message_style"] = "error"
+                # Leave no trace of a migration that did not happen.
+                with contextlib.suppress(OSError):
+                    os.rmdir(PROFILES_DIR)  # only succeeds if still empty
+                return
     else:
         # Create default profile and symlink
         default_dir = os.path.join(PROFILES_DIR, "default")
         try:
             os.makedirs(default_dir, exist_ok=True)
-            os.symlink(default_dir, CLAUDE_DIR)
+            link_dir(default_dir, CLAUDE_DIR)
             state["message"] = "Initialized 'default' profile"
         except Exception as e:
             state["message"] = f"Initialization error: {e}"
@@ -80,16 +92,25 @@ def init_profiles():
     # lives outside ~/.claude, so it must be migrated/symlinked per profile too,
     # otherwise switching profiles keeps logging in as the same account.
     active_profile_dir = None
-    if os.path.islink(CLAUDE_DIR):
+    if is_link(CLAUDE_DIR):
         try:
-            active_profile_dir = os.path.abspath(os.path.expanduser(os.readlink(CLAUDE_DIR)))
+            active_profile_dir = os.path.abspath(os.path.expanduser(read_link(CLAUDE_DIR)))
         except Exception:
             pass
     if not active_profile_dir:
         active_profile_dir = os.path.join(PROFILES_DIR, "default")
 
     profile_json = os.path.join(active_profile_dir, "claude.json")
-    if os.path.lexists(CLAUDE_JSON):
+    if COPY_LIVE_JSON:
+        # The live file is the active profile's real copy; only seed the
+        # profile from it the first time.
+        if os.path.isfile(CLAUDE_JSON) and not os.path.lexists(profile_json):
+            try:
+                shutil.copy2(CLAUDE_JSON, profile_json)
+            except Exception as e:
+                state["message"] = f"Failed to migrate ~/.claude.json: {e}"
+                state["message_style"] = "error"
+    elif os.path.lexists(CLAUDE_JSON):
         if not os.path.islink(CLAUDE_JSON):
             try:
                 if not os.path.lexists(profile_json):
@@ -107,6 +128,59 @@ def init_profiles():
         except Exception as e:
             state["message"] = f"Initialization error (claude.json): {e}"
             state["message_style"] = "error"
+
+def move_claude_dir(dest):
+    """Move the real ~/.claude out of the way, all or nothing.
+
+    shutil.move falls back to copy + delete when a rename fails. On Windows a
+    rename fails whenever Claude Code holds a file open, and the delete would
+    then stop halfway, leaving ~/.claude partly gone. A plain rename either
+    happens or does not.
+    """
+    if not IS_WINDOWS:
+        shutil.move(CLAUDE_DIR, dest)
+        return
+    try:
+        os.rename(CLAUDE_DIR, dest)
+    except PermissionError as e:
+        raise RuntimeError("~/.claude is in use. Close every Claude Code "
+                           "session and run tui-claude again.") from e
+
+def linked_profile():
+    """The profile ~/.claude points at right now, or None."""
+    if not is_link(CLAUDE_DIR):
+        return None
+    try:
+        parent, name = os.path.split(os.path.realpath(CLAUDE_DIR))
+    except OSError:
+        return None
+    if os.path.normcase(parent) != os.path.normcase(os.path.realpath(PROFILES_DIR)):
+        return None
+    return name
+
+def capture_live_json():
+    """Copy mode: save the live ~/.claude.json back into its profile.
+
+    Claude Code writes to the live file, so the profile's copy is stale until
+    this runs. Anything that reads <profile>/claude.json must call it first.
+    """
+    profile = linked_profile()
+    if COPY_LIVE_JSON and profile and os.path.isfile(CLAUDE_JSON):
+        shutil.copy2(CLAUDE_JSON, os.path.join(PROFILES_DIR, profile, "claude.json"))
+
+def place_live_json(profile_dir):
+    """Point (or, in copy mode, copy) ~/.claude.json at a profile's own."""
+    profile_json = os.path.join(profile_dir, "claude.json")
+    if COPY_LIVE_JSON:
+        if os.path.isfile(profile_json):
+            shutil.copy2(profile_json, CLAUDE_JSON)
+        elif os.path.lexists(CLAUDE_JSON):
+            # A profile with no config yet must not inherit another account's.
+            os.remove(CLAUDE_JSON)
+        return
+    if os.path.lexists(CLAUDE_JSON):
+        os.unlink(CLAUDE_JSON)
+    os.symlink(profile_json, CLAUDE_JSON)
 
 def refresh_profiles():
     """Scan profiles and active state."""
@@ -138,16 +212,7 @@ def refresh_profiles():
     state["pool"] = sharing.pool_summary(PROFILES_DIR)
 
     # Find active profile
-    state["active_profile"] = None
-    if os.path.islink(CLAUDE_DIR):
-        try:
-            target = os.readlink(CLAUDE_DIR)
-            abs_target = os.path.abspath(os.path.expanduser(target))
-            parent, name = os.path.split(abs_target)
-            if os.path.abspath(parent) == os.path.abspath(PROFILES_DIR):
-                state["active_profile"] = name
-        except Exception:
-            pass
+    state["active_profile"] = linked_profile()
 
     # Normalize selection index
     if not state["profiles"]:
@@ -167,15 +232,14 @@ def switch_profile(name):
         # The only instant where both profiles are known and neither is in use:
         # hand the pool what the outgoing profile changed, then dress the
         # incoming one with it. No-op unless the profiles share.
+        capture_live_json()
         sharing.sync_on_switch(PROFILES_DIR, state["active_profile"], name)
 
         if os.path.lexists(CLAUDE_DIR):
-            os.unlink(CLAUDE_DIR)
-        os.symlink(profile_dir, CLAUDE_DIR)
+            remove_link(CLAUDE_DIR)
+        link_dir(profile_dir, CLAUDE_DIR)
 
-        if os.path.lexists(CLAUDE_JSON):
-            os.unlink(CLAUDE_JSON)
-        os.symlink(os.path.join(profile_dir, "claude.json"), CLAUDE_JSON)
+        place_live_json(profile_dir)
 
         state["message"] = f"Switched to profile '{name}'."
         state["message_style"] = "success"
@@ -226,10 +290,16 @@ def delete_profile(name):
         is_active = (state["active_profile"] == name)
         if is_active:
             if os.path.lexists(CLAUDE_DIR):
-                os.unlink(CLAUDE_DIR)
+                remove_link(CLAUDE_DIR)
             if os.path.lexists(CLAUDE_JSON):
                 os.unlink(CLAUDE_JSON)
 
+        # rmtree does not follow symlinks or junctions, but this is the one
+        # operation that must never reach into the pool: unlink first.
+        for item in sharing.SHARED_DIRS + sharing.SHARED_FILES:
+            path = os.path.join(profile_dir, item)
+            if is_link(path):
+                remove_link(path)
         shutil.rmtree(profile_dir)
         state["message"] = f"Deleted profile '{name}'."
         state["message_style"] = "success"
@@ -267,6 +337,17 @@ app_style = Style.from_dict({
 # Keyboard Bindings
 kb = KeyBindings()
 
+def refuse_unmanaged(event):
+    """~/.claude is still a real directory: the migration has not happened, so
+    switching, adding or sharing would act on a half-initialised layout."""
+    if os.path.lexists(CLAUDE_DIR) and not is_link(CLAUDE_DIR):
+        state["message"] = ("~/.claude has not been migrated yet. Close every "
+                            "Claude Code session and restart tui-claude.")
+        state["message_style"] = "error"
+        event.app.invalidate()
+        return True
+    return False
+
 @kb.add("q")
 @kb.add("c-c")
 def exit_app(event):
@@ -288,6 +369,8 @@ def move_down(event):
 
 @kb.add("enter")
 def do_switch(event):
+    if refuse_unmanaged(event):
+        return
     if state["profiles"]:
         selected = state["profiles"][state["selected_index"]]
         switch_profile(selected)
@@ -296,6 +379,8 @@ def do_switch(event):
 
 @kb.add("a")
 def do_add(event):
+    if refuse_unmanaged(event):
+        return
     async def add_flow():
         def prompt_add():
             print("\n" * 2)
@@ -329,6 +414,8 @@ def do_add(event):
 
 @kb.add("r")
 def do_remove(event):
+    if refuse_unmanaged(event):
+        return
     if not state["profiles"]:
         return
 
@@ -385,6 +472,7 @@ def enable_sharing_flow(selected, ask=input, say=print):
         state["message_style"] = "info"
         return False
 
+    capture_live_json()  # split_claude_json reads the profile's copy
     result = sharing.enable_sharing(PROFILES_DIR, selected)
     if selected == state["active_profile"]:
         switch_profile(selected)  # refresh the symlinks in place
@@ -423,6 +511,7 @@ def disable_sharing_flow(selected, ask=input, say=print):
         state["message_style"] = "info"
         return False
 
+    capture_live_json()
     result = sharing.disable_sharing(PROFILES_DIR, selected, take_copy=(choice == "k"))
     if selected == state["active_profile"]:
         switch_profile(selected)
@@ -438,6 +527,8 @@ def disable_sharing_flow(selected, ask=input, say=print):
 @kb.add("s")
 def do_toggle_sharing(event):
     """Move the selected profile in or out of the shared data pool."""
+    if refuse_unmanaged(event):
+        return
     if not state["profiles"]:
         return
 
@@ -489,6 +580,8 @@ def do_change_command(event):
 
 @kb.add("l")
 def do_login(event):
+    if refuse_unmanaged(event):
+        return
     if not state["profiles"]:
         return
 
@@ -540,9 +633,14 @@ def get_screen_text():
     tokens.append(("", " Active profile: "))
     tokens.append(("class:active", f"● {active}\n"))
     tokens.append(("", " Config location: "))
-    tokens.append(("class:subtitle", f"{CLAUDE_DIR} -> {os.readlink(CLAUDE_DIR) if os.path.islink(CLAUDE_DIR) else 'Not a symlink'}\n"))
+    tokens.append(("class:subtitle", f"{CLAUDE_DIR} -> {read_link(CLAUDE_DIR) if is_link(CLAUDE_DIR) else 'Not a symlink'}\n"))
     tokens.append(("", " Account cache: "))
-    tokens.append(("class:subtitle", f"{CLAUDE_JSON} -> {os.readlink(CLAUDE_JSON) if os.path.islink(CLAUDE_JSON) else 'Not a symlink'}\n"))
+    if COPY_LIVE_JSON:
+        where = (f"copied to/from {os.path.join(PROFILES_DIR, state['active_profile'], 'claude.json')}"
+                 if state["active_profile"] else "Not managed")
+    else:
+        where = read_link(CLAUDE_JSON) if os.path.islink(CLAUDE_JSON) else "Not a symlink"
+    tokens.append(("class:subtitle", f"{CLAUDE_JSON} -> {where}\n"))
     tokens.append(("", f" Login command: {state['login_command']}\n"))
     tokens.append(("", "\n"))
 
