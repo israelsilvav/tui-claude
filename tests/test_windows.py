@@ -125,6 +125,20 @@ def test_migration_refuses_while_a_file_is_open(tmp_path, monkeypatch):
         assert "Close every Claude Code session" in main.state["message"]
         assert sorted(os.listdir(claude_dir)) == ["history.jsonl", "settings.json"]
         assert not os.path.isjunction(claude_dir)
+        assert not os.path.exists(main.PROFILES_DIR), "no empty leftover"
+
+        class Event:
+            class app:
+                @staticmethod
+                def invalidate():
+                    pass
+
+        for handler in (main.do_switch, main.do_add, main.do_remove,
+                        main.do_toggle_sharing, main.do_login):
+            main.state["message"] = ""
+            handler(Event)
+            assert "not been migrated" in main.state["message"], handler.__name__
+        assert not os.path.exists(main.PROFILES_DIR), "nothing acted on the layout"
     finally:
         monkeypatch.delenv("TUI_CLAUDE_TEST_DIR")
         importlib.reload(main)

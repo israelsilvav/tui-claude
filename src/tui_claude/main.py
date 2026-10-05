@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import contextlib
 import os
 import shutil
 import time
@@ -72,6 +73,9 @@ def init_profiles():
             except Exception as e:
                 state["message"] = f"Failed to migrate ~/.claude: {e}"
                 state["message_style"] = "error"
+                # Leave no trace of a migration that did not happen.
+                with contextlib.suppress(OSError):
+                    os.rmdir(PROFILES_DIR)  # only succeeds if still empty
                 return
     else:
         # Create default profile and symlink
@@ -333,6 +337,17 @@ app_style = Style.from_dict({
 # Keyboard Bindings
 kb = KeyBindings()
 
+def refuse_unmanaged(event):
+    """~/.claude is still a real directory: the migration has not happened, so
+    switching, adding or sharing would act on a half-initialised layout."""
+    if os.path.lexists(CLAUDE_DIR) and not is_link(CLAUDE_DIR):
+        state["message"] = ("~/.claude has not been migrated yet. Close every "
+                            "Claude Code session and restart tui-claude.")
+        state["message_style"] = "error"
+        event.app.invalidate()
+        return True
+    return False
+
 @kb.add("q")
 @kb.add("c-c")
 def exit_app(event):
@@ -354,6 +369,8 @@ def move_down(event):
 
 @kb.add("enter")
 def do_switch(event):
+    if refuse_unmanaged(event):
+        return
     if state["profiles"]:
         selected = state["profiles"][state["selected_index"]]
         switch_profile(selected)
@@ -362,6 +379,8 @@ def do_switch(event):
 
 @kb.add("a")
 def do_add(event):
+    if refuse_unmanaged(event):
+        return
     async def add_flow():
         def prompt_add():
             print("\n" * 2)
@@ -395,6 +414,8 @@ def do_add(event):
 
 @kb.add("r")
 def do_remove(event):
+    if refuse_unmanaged(event):
+        return
     if not state["profiles"]:
         return
 
@@ -506,6 +527,8 @@ def disable_sharing_flow(selected, ask=input, say=print):
 @kb.add("s")
 def do_toggle_sharing(event):
     """Move the selected profile in or out of the shared data pool."""
+    if refuse_unmanaged(event):
+        return
     if not state["profiles"]:
         return
 
@@ -557,6 +580,8 @@ def do_change_command(event):
 
 @kb.add("l")
 def do_login(event):
+    if refuse_unmanaged(event):
+        return
     if not state["profiles"]:
         return
 
