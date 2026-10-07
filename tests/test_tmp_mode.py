@@ -285,3 +285,125 @@ def test_finish_after_the_profile_was_deleted_only_drops_the_pin(tmp_path):
     tmp_mode.finish(profiles, "gone", os.getpid())
 
     assert tmp_mode.live_pins(profiles) == {}
+
+
+# --- end to end: the real exec, sh and exit hook --------------------------------
+
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+
+FAKE_SHELL = """#!/bin/sh
+{
+  echo "CONFIG=$CLAUDE_CONFIG_DIR"
+  echo "PROFILE=$TUI_CLAUDE_PROFILE"
+  echo "PINS=$(ls "$PINS_DIR" | tr '\\n' ' ')"
+} > "$REPORT"
+"$PY" -c '
+import json, os
+path = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], ".claude.json")
+data = json.load(open(path))
+data["trustedInPinnedTerminal"] = True
+json.dump(data, open(path, "w"))
+'
+exit 3
+"""
+
+
+@pytest.fixture
+def sandbox(tmp_path, monkeypatch):
+    """A migrated layout with `work` and `personal` sharing; `personal` global."""
+    import importlib
+    monkeypatch.setenv("TUI_CLAUDE_TEST_DIR", str(tmp_path))
+    from tui_claude import main as main_module
+    importlib.reload(main_module)
+    main_module.refresh_profiles()
+    for name in ("work", "personal"):
+        main_module.add_profile(name)
+        write(os.path.join(main_module.PROFILES_DIR, name, "claude.json"),
+              {"oauthAccount": {"emailAddress": f"{name}@example.net"}})
+        sharing.enable_sharing(main_module.PROFILES_DIR, name)
+    main_module.switch_profile("personal")
+    yield main_module
+    monkeypatch.delenv("TUI_CLAUDE_TEST_DIR", raising=False)
+    importlib.reload(main_module)
+
+
+def cli_env(tui, **extra):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("CLAUDE_CONFIG_DIR", "TUI_CLAUDE_PROFILE")}
+    env.update(TUI_CLAUDE_TEST_DIR=os.path.dirname(tui.PROFILES_DIR),
+               PYTHONPATH=SRC, PY=sys.executable,
+               PINS_DIR=tmp_mode.pins_dir(tui.PROFILES_DIR), **extra)
+    return env
+
+
+def test_tmp_end_to_end(sandbox, tmp_path):
+    shell = str(tmp_path / "fake shell.sh")   # a space in the path, on purpose
+    with open(shell, "w") as handle:
+        handle.write(FAKE_SHELL)
+    os.chmod(shell, 0o755)
+    report = str(tmp_path / "report.txt")
+
+    proc = subprocess.run([sys.executable, "-m", "tui_claude.main", "tmp", "work"],
+                          env=cli_env(sandbox, SHELL=shell, REPORT=report),
+                          capture_output=True, text=True, timeout=60)
+
+    assert proc.returncode == 3, proc.stderr          # the shell's status is passed on
+    lines = open(report).read().splitlines()
+    assert f"CONFIG={os.path.join(sandbox.PROFILES_DIR, 'work')}" in lines
+    assert "PROFILE=work" in lines
+    pins_line = next(line for line in lines if line.startswith("PINS="))
+    assert pins_line.split("=", 1)[1].strip().isdigit(), "exactly one pin while inside"
+    assert os.listdir(tmp_mode.pins_dir(sandbox.PROFILES_DIR)) == [], "gone after exit"
+    pool = read(os.path.join(sharing.pool_dir(sandbox.PROFILES_DIR), "claude.shared.json"))
+    assert pool["trustedInPinnedTerminal"] is True
+    assert "This terminal now uses profile 'work'." in proc.stdout
+    assert "Back to the global profile 'personal'." in proc.stdout
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or not os.path.exists("/bin/bash"),
+                    reason="needs Linux and bash")
+def test_ctrl_c_in_the_pinned_shell_keeps_the_exit_hook(sandbox, tmp_path):
+    import pty
+    import select
+
+    shell = str(tmp_path / "bash-norc")
+    with open(shell, "w") as handle:
+        handle.write("#!/bin/sh\nexec /bin/bash --norc --noprofile -i\n")
+    os.chmod(shell, 0o755)
+    env = cli_env(sandbox, SHELL=shell, PS1="pinned> ", TERM="dumb")
+
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execve(sys.executable, [sys.executable, "-m", "tui_claude.main", "tmp", "work"], env)
+
+    def read_until(marker, timeout=15):
+        out = b""
+        deadline = time.time() + timeout
+        while marker not in out:
+            remaining = deadline - time.time()
+            assert remaining > 0, f"timed out waiting for {marker!r}; got {out!r}"
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 1024)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        return out
+
+    read_until(b"pinned> ")
+    os.write(fd, b"\x03")                  # Ctrl-C at the prompt
+    read_until(b"pinned> ")
+    os.write(fd, b"sleep 30\n")
+    time.sleep(0.5)
+    os.write(fd, b"\x03")                  # Ctrl-C interrupting a command
+    read_until(b"pinned> ")
+    os.write(fd, b"exit\n")
+    rest = read_until(b"Back to the global profile")
+    os.waitpid(pid, 0)
+
+    assert b"Back to the global profile 'personal'." in rest
+    assert tmp_mode.live_pins(sandbox.PROFILES_DIR) == {}

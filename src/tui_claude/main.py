@@ -46,6 +46,14 @@ state = {
     "tmp_mode": False,   # True when started as `tui-claude tmp`
 }
 
+USAGE = """\
+usage: tui-claude            manage profiles; Enter switches the global profile
+       tui-claude tmp        pick a profile for this terminal only
+       tui-claude tmp NAME   use profile NAME in this terminal only"""
+
+UNMANAGED = ("~/.claude has not been migrated yet. Close every "
+             "Claude Code session and restart tui-claude.")
+
 def init_profiles():
     """Ensure the profile directories exist and migrate existing ~/.claude directory."""
     if not os.path.exists(PROFILES_DIR):
@@ -419,8 +427,7 @@ def refuse_unmanaged(event):
     """~/.claude is still a real directory: the migration has not happened, so
     switching, adding or sharing would act on a half-initialised layout."""
     if os.path.lexists(CLAUDE_DIR) and not is_link(CLAUDE_DIR):
-        state["message"] = ("~/.claude has not been migrated yet. Close every "
-                            "Claude Code session and restart tui-claude.")
+        state["message"] = UNMANAGED
         state["message_style"] = "error"
         event.app.invalidate()
         return True
@@ -451,6 +458,9 @@ def do_switch(event):
         return
     if state["profiles"]:
         selected = state["profiles"][state["selected_index"]]
+        if state["tmp_mode"]:
+            event.app.exit(result=selected)   # main() pins it once the screen is gone
+            return
         switch_profile(selected)
         refresh_profiles()
         event.app.invalidate()
@@ -717,6 +727,34 @@ def login_env(name):
         return tmp_mode.config_env(os.path.join(PROFILES_DIR, name), name)
     return tmp_mode.global_env()
 
+def run_login(selected, run=subprocess.run, say=print):
+    """Get `selected` ready and run the login command for it.
+
+    The global mode activates the profile first. tmp mode leaves the global
+    profile alone and points CLAUDE_CONFIG_DIR at the selected one instead.
+    """
+    if state["tmp_mode"]:
+        say(f"Preparing '{selected}' for this terminal only...")
+        prepare_tmp(selected)
+    else:
+        say(f"Making sure '{selected}' is active...")
+        switch_profile(selected)
+        refresh_profiles()
+
+    say(f"Running login command: {state['login_command']}")
+    say("-" * 40)
+    try:
+        # Run the login command interactively
+        run(state["login_command"], shell=True, check=True, env=login_env(selected))
+        say("-" * 40)
+        say("Login command finished successfully.")
+    except subprocess.CalledProcessError as e:
+        say("-" * 40)
+        say(f"Command failed with exit code {e.returncode}")
+    except Exception as e:
+        say("-" * 40)
+        say(f"Failed to execute command: {e}")
+
 @kb.add("l")
 def do_login(event):
     if refuse_unmanaged(event):
@@ -726,32 +764,14 @@ def do_login(event):
 
     selected = state["profiles"][state["selected_index"]]
     async def login_flow():
-        def run_login():
+        def run_it():
             print("\n" * 2)
             print(f"=== RUNNING LOGIN FOR PROFILE: {selected} ===")
-            print(f"Making sure '{selected}' is active...")
-            switch_profile(selected)
-            refresh_profiles()
-
-            print(f"Running login command: {state['login_command']}")
-            print("-" * 40)
-            try:
-                # Run the login command interactively
-                subprocess.run(state["login_command"], shell=True, check=True,
-                               env=login_env(selected))
-                print("-" * 40)
-                print("Login command finished successfully.")
-            except subprocess.CalledProcessError as e:
-                print("-" * 40)
-                print(f"Command failed with exit code {e.returncode}")
-            except Exception as e:
-                print("-" * 40)
-                print(f"Failed to execute command: {e}")
-
+            run_login(selected)
             print("Press Enter to return to the TUI...")
             input()
 
-        await run_in_terminal(run_login)
+        await run_in_terminal(run_it)
         refresh_profiles()
         event.app.invalidate()
 
@@ -865,7 +885,80 @@ def get_screen_text():
 
     return tokens
 
-def main():
+# tmp mode: one terminal pinned to one profile
+
+def tmp_refusal():
+    """Why this terminal cannot be pinned, or None."""
+    if IS_WINDOWS:
+        return "tmp mode is not supported on Windows yet."
+    pinned = os.environ.get(tmp_mode.PROFILE_ENV)
+    if pinned:
+        return f"This terminal already uses '{pinned}'. Type 'exit' first."
+    return None
+
+
+def prepare_tmp(name):
+    """Make a profile usable through CLAUDE_CONFIG_DIR."""
+    tmp_mode.link_account_json(os.path.join(PROFILES_DIR, name))
+    in_use = (name == state["active_profile"]
+              or bool(tmp_mode.live_pins(PROFILES_DIR).get(name)))
+    sharing.prepare_profile(PROFILES_DIR, name, in_use=in_use)
+
+
+def pin_here(name):
+    """Prepare `name`, register this terminal and exec into the pinned shell."""
+    prepare_tmp(name)
+    tmp_mode.register_pin(PROFILES_DIR, name)
+    argv, env = tmp_mode.launch_command(os.path.join(PROFILES_DIR, name), name)
+    print(f"This terminal now uses profile '{name}'.")
+    if state["active_profile"]:
+        print(f"Type 'exit' to return to the global profile ('{state['active_profile']}').")
+    else:
+        print("Type 'exit' to leave.")
+    sys.stdout.flush()
+    os.execve(argv[0], argv, env)
+
+
+def run_tmp(name=None):
+    refusal = tmp_refusal()
+    if refusal is None:
+        refresh_profiles()   # migration, repair, dead pins, active profile
+        if os.path.lexists(CLAUDE_DIR) and not is_link(CLAUDE_DIR):
+            refusal = UNMANAGED
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 1
+    if name is None:
+        state["tmp_mode"] = True
+        name = run_tui()
+        if name is None:
+            return 0
+        refresh_profiles()   # the screen may have added, renamed or shared profiles
+    elif name not in state["profiles"]:
+        print(f"Profile '{name}' does not exist.", file=sys.stderr)
+        return 1
+    pin_here(name)
+    return 0
+
+
+def tmp_exit(name, pid):
+    """`_tmp-exit`: run by a pinned terminal's sh after its shell exits."""
+    try:
+        pid = int(pid)
+    except ValueError:
+        return 2
+    try:
+        tmp_mode.finish(PROFILES_DIR, name, pid)
+    except Exception as exc:
+        print(f"tui-claude: could not return '{name}' settings to the pool: {exc}",
+              file=sys.stderr)
+    back = linked_profile()
+    print(f"Back to the global profile '{back}'." if back else "Back to the global profile.")
+    return 0
+
+
+def run_tui():
+    """The full-screen TUI. Returns the profile picked in tmp mode, else None."""
     refresh_profiles()
     content = FormattedTextControl(get_screen_text)
     body = Window(content=content)
@@ -877,7 +970,24 @@ def main():
         style=app_style,
         full_screen=True
     )
-    app.run()
+    return app.run()
+
+
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else list(argv)
+    if not args:
+        run_tui()
+        return 0
+    if args in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
+    if args[0] == "tmp" and len(args) <= 2:
+        return run_tmp(args[1] if len(args) == 2 else None)
+    if args[0] == "_tmp-exit" and len(args) == 3:
+        return tmp_exit(args[1], args[2])
+    print(USAGE, file=sys.stderr)
+    return 2
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

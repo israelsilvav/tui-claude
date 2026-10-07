@@ -592,3 +592,120 @@ def test_login_in_tmp_mode_targets_the_selected_profile(tui):
     env = tui.login_env("work")
 
     assert env["CLAUDE_CONFIG_DIR"] == os.path.abspath(os.path.join(tui.PROFILES_DIR, "work"))
+
+
+# --- the command line --------------------------------------------------------
+
+def test_main_without_arguments_runs_the_tui(tui, monkeypatch):
+    calls = []
+    monkeypatch.setattr(tui, "run_tui", lambda: calls.append("tui"))
+
+    assert tui.main([]) == 0
+    assert calls == ["tui"]
+
+
+def test_help_and_unknown_arguments(tui, capsys):
+    assert tui.main(["--help"]) == 0
+    assert "tui-claude tmp NAME" in capsys.readouterr().out
+    assert tui.main(["bogus"]) == 2
+    assert tui.main(["tmp", "a", "b"]) == 2
+
+
+def test_tmp_is_refused_inside_a_pinned_terminal(tui, monkeypatch, capsys):
+    monkeypatch.setenv("TUI_CLAUDE_PROFILE", "work")
+
+    assert tui.main(["tmp"]) == 1
+    assert "This terminal already uses 'work'. Type 'exit' first." in capsys.readouterr().err
+
+
+def test_tmp_is_refused_on_windows(tui, monkeypatch, capsys):
+    monkeypatch.setattr(tui, "IS_WINDOWS", True)
+
+    assert tui.main(["tmp", "default"]) == 1
+    assert "tmp mode is not supported on Windows yet." in capsys.readouterr().err
+
+
+def test_tmp_with_an_unknown_profile(tui, monkeypatch, capsys):
+    monkeypatch.delenv("TUI_CLAUDE_PROFILE", raising=False)
+
+    assert tui.main(["tmp", "nope"]) == 1
+    assert "Profile 'nope' does not exist." in capsys.readouterr().err
+
+
+def test_tmp_picker_quit_pins_nothing(tui, monkeypatch):
+    monkeypatch.delenv("TUI_CLAUDE_PROFILE", raising=False)
+    monkeypatch.setattr(tui, "run_tui", lambda: None)
+    monkeypatch.setattr(tui.os, "execve", lambda *a: pytest.fail("must not exec"))
+
+    assert tui.main(["tmp"]) == 0
+    assert tui.state["tmp_mode"] is True
+    assert tmp_mode.live_pins(tui.PROFILES_DIR) == {}
+
+
+def test_tmp_picker_choice_is_prepared_pinned_and_launched(tui, monkeypatch, capsys):
+    monkeypatch.delenv("TUI_CLAUDE_PROFILE", raising=False)
+    tui.add_profile("work")
+    tui.add_profile("personal")        # the last one added is the global profile
+    launched = []
+    monkeypatch.setattr(tui, "run_tui", lambda: "work")
+    monkeypatch.setattr(tui.os, "execve",
+                        lambda path, argv, env: launched.append((path, argv, env)))
+
+    tui.main(["tmp"])
+
+    (path, argv, env), = launched
+    assert path == "/bin/sh"
+    assert env["CLAUDE_CONFIG_DIR"] == os.path.abspath(os.path.join(tui.PROFILES_DIR, "work"))
+    assert tmp_mode.live_pins(tui.PROFILES_DIR) == {"work": 1}
+    assert os.readlink(os.path.join(tui.PROFILES_DIR, "work", ".claude.json")) == "claude.json"
+    out = capsys.readouterr().out
+    assert "This terminal now uses profile 'work'." in out
+    assert "Type 'exit' to return to the global profile ('personal')." in out
+
+
+def test_pinning_the_global_profile_does_not_rebuild_it(tui, monkeypatch):
+    monkeypatch.delenv("TUI_CLAUDE_PROFILE", raising=False)
+    tui.add_profile("work")
+    with open(os.path.join(tui.PROFILES_DIR, "work", "claude.json"), "w") as handle:
+        json.dump({"oauthAccount": {"emailAddress": "w@example.net"}}, handle)
+    sharing.enable_sharing(tui.PROFILES_DIR, "work")
+    tui.switch_profile("work")
+    pool = os.path.join(sharing.pool_dir(tui.PROFILES_DIR), "claude.shared.json")
+    data = sharing.load_json(pool)
+    data["fromElsewhere"] = 1
+    sharing.save_json(pool, data)
+    config = os.path.join(tui.PROFILES_DIR, "work", "claude.json")
+    before = open(config).read()
+    monkeypatch.setattr(tui.os, "execve", lambda *a: None)
+
+    tui.main(["tmp", "work"])
+
+    assert open(config).read() == before, "a global session may be running on it"
+
+
+def test_tmp_exit_reports_the_global_profile_and_drops_the_pin(tui, capsys):
+    tui.add_profile("work")
+    tui.add_profile("personal")
+    tmp_mode.register_pin(tui.PROFILES_DIR, "work", os.getpid())
+
+    assert tui.main(["_tmp-exit", "work", str(os.getpid())]) == 0
+    assert "Back to the global profile 'personal'." in capsys.readouterr().out
+    assert tmp_mode.live_pins(tui.PROFILES_DIR) == {}
+
+
+def test_tmp_exit_with_a_bad_pid(tui):
+    assert tui.main(["_tmp-exit", "work", "x"]) == 2
+
+
+def test_login_in_tmp_mode_prepares_without_switching(tui):
+    tui.add_profile("work")
+    tui.add_profile("personal")
+    tui.state["tmp_mode"] = True
+    envs = []
+
+    tui.run_login("work", run=lambda cmd, **kw: envs.append(kw["env"]),
+                  say=lambda *a: None)
+
+    assert tui.linked_profile() == "personal", "the global profile did not move"
+    assert envs[0]["CLAUDE_CONFIG_DIR"] == os.path.abspath(os.path.join(tui.PROFILES_DIR, "work"))
+    assert os.path.islink(os.path.join(tui.PROFILES_DIR, "work", ".claude.json"))
