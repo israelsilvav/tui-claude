@@ -709,3 +709,54 @@ def test_login_in_tmp_mode_prepares_without_switching(tui):
     assert tui.linked_profile() == "personal", "the global profile did not move"
     assert envs[0]["CLAUDE_CONFIG_DIR"] == os.path.abspath(os.path.join(tui.PROFILES_DIR, "work"))
     assert os.path.islink(os.path.join(tui.PROFILES_DIR, "work", ".claude.json"))
+
+
+# --- what the screen shows about tmp mode ------------------------------------
+
+def test_tmp_mode_screen_says_so_and_offers_use_here(tui):
+    tui.state["tmp_mode"] = True
+
+    screen = render(tui)
+
+    assert "Mode: this terminal only" in screen
+    assert "Use Here" in screen
+    assert "Switch Profile" not in screen
+
+
+def test_global_screen_has_no_tmp_lines(tui, monkeypatch):
+    monkeypatch.delenv("TUI_CLAUDE_PROFILE", raising=False)
+
+    screen = render(tui)
+
+    assert "Mode: this terminal only" not in screen
+    assert "This terminal:" not in screen
+    assert "Switch Profile" in screen
+
+
+def test_screen_inside_a_pinned_terminal_names_its_profile(tui, monkeypatch):
+    monkeypatch.setenv("TUI_CLAUDE_PROFILE", "work")
+
+    assert "This terminal: work (tmp)" in render(tui)
+
+
+def test_status_column_counts_pinned_terminals(tui):
+    tui.add_profile("work")
+    tui.add_profile("personal")
+    pin(tui, "work")
+
+    rows = [line for line in render(tui).splitlines() if line.startswith(" │ ")]
+    work = next(row for row in rows if " work " in row)
+    personal = next(row for row in rows if " personal " in row)
+    assert "inactive ◆1" in work
+    assert len(work) == len(personal), "columns stay aligned"
+
+
+def test_status_column_caps_the_count_at_nine(tui):
+    tui.add_profile("work")
+    tui.add_profile("personal")
+    tui.refresh_profiles()   # add_profile does not list the new profile by itself
+    tui.state["pins"] = {"work": 12}
+
+    screen = render(tui)
+
+    assert "◆9" in screen and "◆12" not in screen

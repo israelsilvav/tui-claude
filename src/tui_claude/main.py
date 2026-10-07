@@ -802,6 +802,12 @@ def get_screen_text():
         where = read_link(CLAUDE_JSON) if os.path.islink(CLAUDE_JSON) else "Not a symlink"
     tokens.append(("class:subtitle", f"{CLAUDE_JSON} -> {where}\n"))
     tokens.append(("", f" Login command: {state['login_command']}\n"))
+    if state["tmp_mode"]:
+        tokens.append(("class:info", " Mode: this terminal only\n"))
+    pinned_here = os.environ.get(tmp_mode.PROFILE_ENV)
+    if pinned_here:
+        tokens.append(("", " This terminal: "))
+        tokens.append(("class:shared", f"{pinned_here} (tmp)\n"))
     tokens.append(("", "\n"))
 
     # Profile List Table
@@ -836,6 +842,9 @@ def get_screen_text():
                 status_style = "class:inactive"
 
             status_text = "● ACTIVE" if is_active else "  inactive"
+            pins = state["pins"].get(name, 0)
+            if pins:
+                status_text += f" ◆{min(pins, 9)}"   # 13 columns at most
             is_sharing = state["sharing"].get(name, False)
             data_text = "⇄ shared" if is_sharing else "⊘ isolated"
             data_style = row_style if is_selected else (
@@ -867,7 +876,7 @@ def get_screen_text():
 
     # Help / Footer
     tokens.append(("class:help-key", " [Enter]"))
-    tokens.append(("class:help-desc", " Switch Profile  "))
+    tokens.append(("class:help-desc", " Use Here  " if state["tmp_mode"] else " Switch Profile  "))
     tokens.append(("class:help-key", " [A]"))
     tokens.append(("class:help-desc", " Add  "))
     tokens.append(("class:help-key", " [N]"))
