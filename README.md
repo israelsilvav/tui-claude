@@ -54,6 +54,7 @@ Works on Windows 10/11 with no administrator rights and no Developer Mode. Windo
 | `~/.claude` and shared directories | symlink | junction |
 | Shared files (`settings.json`, `history.jsonl`, `CLAUDE.md`) | symlink | symlink in Developer Mode, otherwise hardlink |
 | `~/.claude.json` | symlink | real file, copied out of and into the profile on every switch |
+| `tui-claude tmp` | supported | not yet |
 
 > [!IMPORTANT]
 > Close **every** Claude Code session (terminal, IDE extension, desktop app) before the first run. Windows cannot move `~/.claude` while a file in it is open; `tui-claude` then stops with an error and leaves `~/.claude` untouched instead of moving half of it.
@@ -67,7 +68,7 @@ tui-claude
 | Key | Action |
 |-----|--------|
 | `↑` `↓` / `k` `j` | Move the selection |
-| `Enter` | Switch to the selected profile |
+| `Enter` | Switch to the selected profile (in `tui-claude tmp`: use it in this terminal) |
 | `A` | Create a profile |
 | `N` / `F2` | Rename a profile |
 | `R` | Delete a profile (asks first) |
@@ -93,6 +94,43 @@ stays active. `R` is Remove, not Rename.
 
 A new profile has no credentials. Select it and press `L`: the profile is activated and the login command runs in your terminal. The default is `claude auth login`; press `C` to change it.
 
+### One terminal only
+
+`tui-claude tmp` uses a profile in **this terminal only**, so two accounts can
+run side by side:
+
+```
+$ tui-claude tmp            # pick "work" and press Enter
+This terminal now uses profile 'work'.
+Type 'exit' to return to the global profile ('personal').
+$ claude                    # runs as work
+$ exit
+Back to the global profile 'personal'.
+$ claude                    # runs as personal again
+```
+
+`tui-claude tmp work` skips the picker. Every other terminal keeps following
+the global profile, and switching the global profile does not affect a pinned
+terminal. Shared profiles still see the same conversations, memory and
+settings.
+
+It opens a shell with `CLAUDE_CONFIG_DIR` pointing at the profile, which makes
+Claude Code read that profile directly instead of `~/.claude`. `exit` (or
+Ctrl-D) closes that shell. The table shows `◆N` next to a profile pinned in N
+terminals, and refuses to rename, remove or re-share it until they exit.
+
+The prompt does not change by itself. To see the profile in it, add this to
+`~/.bashrc` (or `~/.zshrc`):
+
+```bash
+PS1='${TUI_CLAUDE_PROFILE:+(claude:$TUI_CLAUDE_PROFILE) }'"$PS1"
+```
+
+> [!NOTE]
+> Linux and macOS only for now. On macOS, Claude Code keeps the login of a
+> pinned profile in a separate Keychain entry: log in once with `L` inside
+> `tui-claude tmp`.
+
 ## How it works
 
 Claude Code always reads from two fixed paths. `tui-claude` points them at the profile you selected:
@@ -108,6 +146,8 @@ Directory names starting with `_` are reserved for internals and are never liste
 
 > [!NOTE]
 > Switch profiles with no Claude Code session running. A session that is already open holds its configuration in memory and writes it back on exit — into whichever profile is active *at that moment*.
+>
+> Terminals pinned with `tui-claude tmp` are not affected: they read their profile directly.
 
 ## Sharing data between profiles
 
@@ -167,6 +207,8 @@ An atomic write — write to `.tmp`, rename over the target — replaces a symli
         claude.shared.json        claude.json minus anything account-bound
         .lock
 
+    _pins/                        one file per terminal pinned with `tmp`
+
     work/                         a shared profile
         projects        -> ../_shared/projects
         settings.json   -> ../_shared/settings.json
@@ -174,6 +216,7 @@ An atomic write — write to `.tmp`, rename over the target — replaces a symli
         claude.account.json       identity split out of claude.json
         claude.baseline.json      what the pool looked like at the last switch
         claude.json               rebuilt = shared + account
+        .claude.json    -> claude.json   what Claude Code reads under CLAUDE_CONFIG_DIR
 
     client-x/                     an isolated profile
         projects/                 real directory, sees none of the above
@@ -195,6 +238,13 @@ Its `.credentials.json` is missing. Select it, press `L`, and log in once.
 **Where did my conversations go after I joined a pool?**
 Nowhere — they are in `~/.claude-profiles/_shared/projects/`, and every shared profile reads them. If a file genuinely conflicted it is in `<profile>/_archive-<timestamp>/`.
 
+**I closed a pinned terminal's window instead of typing `exit`.**
+Nothing is lost. Its pin is cleared the next time `tui-claude` opens, and any
+settings it changed reach the other profiles the next time the profile is used.
+
+**A profile cannot be renamed, removed or shared.**
+It is pinned in another terminal (`◆` in the Status column). Type `exit` there first.
+
 ## Development
 
 ```bash
@@ -214,7 +264,9 @@ That environment variable relocates all three paths (`~/.claude`, `~/.claude.jso
 |------|----------|
 | `src/tui_claude/main.py` | TUI: state, key bindings, rendering, profile operations |
 | `src/tui_claude/sharing.py` | Shared pool: merge, fork, repair, `claude.json` split/rebuild |
+| `src/tui_claude/tmp_mode.py` | tmp mode: the `.claude.json` link, pinned terminals, the shell's exec |
 | `tests/test_sharing.py` | Pool semantics, identity isolation, repair, locking |
 | `tests/test_tui_integration.py` | TUI flows and rendering against a sandbox |
+| `tests/test_tmp_mode.py` | tmp mode, including an end-to-end run of the real exec |
 
 `sharing.py` has no dependency on `prompt_toolkit`, and the interactive dialogues take their input and output functions as arguments — so every behaviour is reachable from tests without a terminal.
