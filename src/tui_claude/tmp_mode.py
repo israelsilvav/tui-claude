@@ -19,12 +19,26 @@ Nothing here depends on prompt_toolkit:
 import contextlib
 import os
 import shutil
+import sys
 
 from . import sharing
 from .links import IS_WINDOWS
 
 ACCOUNT_LINK = ".claude.json"
 PINS_NAME = "_pins"   # "_" keeps it out of the profile list
+CONFIG_ENV = "CLAUDE_CONFIG_DIR"
+PROFILE_ENV = "TUI_CLAUDE_PROFILE"
+
+# sh waits for the user's shell, then calls back so the profile's config goes
+# to the pool. `trap :` (a no-op handler, not `trap ''`) keeps sh alive through
+# Ctrl-C without the shell and everything it starts inheriting an ignored
+# SIGINT. The shell's exit status is passed on.
+EXIT_SCRIPT = """trap : INT QUIT
+"$1"
+rc=$?
+"$2" -m tui_claude.main _tmp-exit "$3" "$$"
+exit $rc
+"""
 
 
 def link_account_json(profile_dir):
@@ -148,3 +162,43 @@ def clean_dead_pins(profiles_dir):
         if not alive:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(path)
+
+
+# --- launching and leaving ---------------------------------------------------------
+
+def config_env(profile_dir, profile, base=None):
+    """Environment for anything that must use `profile` instead of the global link."""
+    env = dict(os.environ if base is None else base)
+    env[CONFIG_ENV] = os.path.abspath(profile_dir)   # Claude Code wants it absolute
+    env[PROFILE_ENV] = profile
+    return env
+
+
+def global_env(base=None):
+    """Environment for commands that must follow the global profile, even when
+    tui-claude itself was started inside a pinned terminal."""
+    env = dict(os.environ if base is None else base)
+    env.pop(CONFIG_ENV, None)
+    return env
+
+
+def launch_command(profile_dir, profile, base_env=None):
+    """argv and env for os.execve: sh runs the user's shell, then _tmp-exit.
+
+    exec keeps the pid, so the pin registered just before stays valid, and
+    the Python process (~26 MB) becomes an sh (~1 MB) for the whole session.
+    """
+    env = config_env(profile_dir, profile, base_env)
+    shell = env.get("SHELL") or "/bin/sh"
+    argv = ["/bin/sh", "-c", EXIT_SCRIPT, "tui-claude-tmp", shell, sys.executable, profile]
+    return argv, env
+
+
+def finish(profiles_dir, profile, pid):
+    """What a pinned terminal's sh runs once its shell has exited."""
+    try:
+        if (os.path.isdir(os.path.join(profiles_dir, profile))
+                and sharing.is_shared(profiles_dir, profile)):
+            sharing.split_claude_json(profiles_dir, profile)
+    finally:
+        remove_pin(profiles_dir, pid)

@@ -209,3 +209,79 @@ def test_pins_are_never_probed_on_windows(profiles_dir, monkeypatch):
 
     assert tmp_mode.live_pins(profiles_dir) == {}
     tmp_mode.clean_dead_pins(profiles_dir)
+
+
+# --- the environment and the exec ---------------------------------------------
+
+def test_config_env_points_claude_at_the_profile(profile_dir):
+    env = tmp_mode.config_env(profile_dir, "work", base={"PATH": "/bin"})
+
+    assert env == {"PATH": "/bin",
+                   "CLAUDE_CONFIG_DIR": os.path.abspath(profile_dir),
+                   "TUI_CLAUDE_PROFILE": "work"}
+
+
+def test_config_env_is_absolute_even_from_a_relative_path(profile_dir, monkeypatch):
+    """Claude Code rejects a relative CLAUDE_CONFIG_DIR."""
+    monkeypatch.chdir(os.path.dirname(profile_dir))
+
+    env = tmp_mode.config_env("work", "work", base={})
+
+    assert env["CLAUDE_CONFIG_DIR"] == os.path.abspath(profile_dir)
+
+
+def test_global_env_drops_an_inherited_config_dir():
+    env = tmp_mode.global_env(base={"CLAUDE_CONFIG_DIR": "/x", "PATH": "/bin"})
+
+    assert env == {"PATH": "/bin"}
+
+
+def test_launch_runs_the_user_shell_then_reports_back(profile_dir):
+    argv, env = tmp_mode.launch_command(profile_dir, "work", base_env={"SHELL": "/bin/zsh"})
+
+    assert argv[:2] == ["/bin/sh", "-c"]
+    assert argv[3:] == ["tui-claude-tmp", "/bin/zsh", sys.executable, "work"]
+    assert '"$2" -m tui_claude.main _tmp-exit "$3" "$$"' in argv[2]
+    assert env["CLAUDE_CONFIG_DIR"] == os.path.abspath(profile_dir)
+    assert env["TUI_CLAUDE_PROFILE"] == "work"
+
+
+def test_launch_falls_back_to_sh_without_a_shell(profile_dir):
+    for base in ({}, {"SHELL": ""}):
+        argv, _ = tmp_mode.launch_command(profile_dir, "work", base_env=base)
+        assert argv[4] == "/bin/sh"
+
+
+def test_exit_script_survives_ctrl_c_without_ignoring_it():
+    """`trap ''` would be inherited by the shell and by claude; `trap :` is not."""
+    assert tmp_mode.EXIT_SCRIPT.splitlines()[0] == "trap : INT QUIT"
+
+
+# --- leaving the pinned terminal -----------------------------------------------
+
+def test_finish_returns_config_to_the_pool_and_drops_the_pin(tmp_path):
+    profiles = str(tmp_path / "claude-profiles")
+    work = os.path.join(profiles, "work")
+    os.makedirs(work)
+    write(os.path.join(work, "claude.json"), {"oauthAccount": {"emailAddress": "w@example.net"}})
+    sharing.enable_sharing(profiles, "work")
+    tmp_mode.register_pin(profiles, "work", os.getpid())
+    config = read(os.path.join(work, "claude.json"))
+    config["trustedFolder"] = True
+    write(os.path.join(work, "claude.json"), config)
+
+    tmp_mode.finish(profiles, "work", os.getpid())
+
+    pool = read(os.path.join(sharing.pool_dir(profiles), "claude.shared.json"))
+    assert pool["trustedFolder"] is True
+    assert tmp_mode.live_pins(profiles) == {}
+
+
+def test_finish_after_the_profile_was_deleted_only_drops_the_pin(tmp_path):
+    profiles = str(tmp_path / "claude-profiles")
+    os.makedirs(profiles)
+    tmp_mode.register_pin(profiles, "gone", os.getpid())
+
+    tmp_mode.finish(profiles, "gone", os.getpid())
+
+    assert tmp_mode.live_pins(profiles) == {}
