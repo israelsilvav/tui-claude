@@ -2,8 +2,9 @@
 import contextlib
 import os
 import shutil
-import time
 import subprocess
+import sys
+import time
 from prompt_toolkit import Application
 from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.key_binding import KeyBindings
@@ -12,7 +13,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.styles import Style
 
-from . import sharing
+from . import sharing, tmp_mode
 from .links import IS_WINDOWS, is_link, link_dir, read_link, remove_link
 
 TEST_DIR = os.environ.get("TUI_CLAUDE_TEST_DIR")
@@ -41,7 +42,17 @@ state = {
     "message_style": "info",
     "sharing": {},       # profile name -> bool, read from the filesystem
     "pool": None,        # summary of the shared pool, or None if there is none
+    "pins": {},          # profile name -> terminals pinned with `tui-claude tmp`
+    "tmp_mode": False,   # True when started as `tui-claude tmp`
 }
+
+USAGE = """\
+usage: tui-claude            manage profiles; Enter switches the global profile
+       tui-claude tmp        pick a profile for this terminal only
+       tui-claude tmp NAME   use profile NAME in this terminal only"""
+
+UNMANAGED = ("~/.claude has not been migrated yet. Close every "
+             "Claude Code session and restart tui-claude.")
 
 def init_profiles():
     """Ensure the profile directories exist and migrate existing ~/.claude directory."""
@@ -207,6 +218,10 @@ def refresh_profiles():
         state["message"] = f"Re-linked to the shared pool: {', '.join(sorted(set(healed)))}."
         state["message_style"] = "info"
 
+    # A pinned terminal closed without `exit` leaves its pin behind.
+    tmp_mode.clean_dead_pins(PROFILES_DIR)
+    state["pins"] = tmp_mode.live_pins(PROFILES_DIR)
+
     state["sharing"] = {name: sharing.is_shared(PROFILES_DIR, name)
                         for name in state["profiles"]}
     state["pool"] = sharing.pool_summary(PROFILES_DIR)
@@ -219,6 +234,17 @@ def refresh_profiles():
         state["selected_index"] = 0
     elif state["selected_index"] >= len(state["profiles"]):
         state["selected_index"] = len(state["profiles"]) - 1
+
+def refuse_pinned(name):
+    """A profile open in a pinned terminal must not move under it: its
+    CLAUDE_CONFIG_DIR would point at a path that no longer exists."""
+    count = tmp_mode.live_pins(PROFILES_DIR).get(name, 0)
+    if not count:
+        return False
+    state["message"] = (f"Profile '{name}' is in use by {count} terminal(s) (tmp). "
+                        "Type 'exit' in them first.")
+    state["message_style"] = "error"
+    return True
 
 def switch_profile(name):
     """Switch the active symlink to the chosen profile."""
@@ -233,7 +259,9 @@ def switch_profile(name):
         # hand the pool what the outgoing profile changed, then dress the
         # incoming one with it. No-op unless the profiles share.
         capture_live_json()
-        sharing.sync_on_switch(PROFILES_DIR, state["active_profile"], name)
+        sharing.sync_on_switch(
+            PROFILES_DIR, state["active_profile"], name,
+            entering_in_use=bool(tmp_mode.live_pins(PROFILES_DIR).get(name)))
 
         if os.path.lexists(CLAUDE_DIR):
             remove_link(CLAUDE_DIR)
@@ -249,8 +277,14 @@ def switch_profile(name):
         state["message_style"] = "error"
         return False
 
-def add_profile(name, share=False):
-    """Create a new profile folder, optionally joining the shared pool."""
+def add_profile(name, share=False, activate=None):
+    """Create a new profile folder, optionally joining the shared pool.
+
+    It becomes the global profile unless `activate` says otherwise; by
+    default tmp mode leaves the global profile alone.
+    """
+    if activate is None:
+        activate = not state["tmp_mode"]
     name = "".join([c for c in name if c.isalnum() or c in ("-", "_")]).strip()
     name = name.lstrip("_")  # "_" is reserved for internals
     if not name:
@@ -268,9 +302,12 @@ def add_profile(name, share=False):
         os.makedirs(profile_dir, exist_ok=True)
         if share:
             sharing.enable_sharing(PROFILES_DIR, name)
-        switch_profile(name)
         where = "sharing data" if share else "with its own data"
-        state["message"] = f"Created and activated profile '{name}' ({where})."
+        if activate:
+            switch_profile(name)
+            state["message"] = f"Created and activated profile '{name}' ({where})."
+        else:
+            state["message"] = f"Created profile '{name}' ({where})."
         state["message_style"] = "success"
         return True
     except Exception as e:
@@ -301,6 +338,8 @@ def rename_profile(old, new):
     if not os.path.isdir(old_dir):
         state["message"] = f"Profile '{old}' does not exist."
         state["message_style"] = "error"
+        return False
+    if refuse_pinned(old):
         return False
     if os.path.lexists(new_dir):
         state["message"] = f"Profile '{new}' already exists."
@@ -339,6 +378,8 @@ def delete_profile(name):
         state["message"] = f"Profile '{name}' does not exist."
         state["message_style"] = "error"
         return False
+    if refuse_pinned(name):
+        return False
 
     try:
         is_active = (state["active_profile"] == name)
@@ -364,7 +405,7 @@ def delete_profile(name):
             if state["profiles"]:
                 switch_profile(state["profiles"][0])
             else:
-                add_profile("default")
+                add_profile("default", activate=True)   # ~/.claude must point somewhere
         return True
     except Exception as e:
         state["message"] = f"Failed to delete profile: {e}"
@@ -395,8 +436,7 @@ def refuse_unmanaged(event):
     """~/.claude is still a real directory: the migration has not happened, so
     switching, adding or sharing would act on a half-initialised layout."""
     if os.path.lexists(CLAUDE_DIR) and not is_link(CLAUDE_DIR):
-        state["message"] = ("~/.claude has not been migrated yet. Close every "
-                            "Claude Code session and restart tui-claude.")
+        state["message"] = UNMANAGED
         state["message_style"] = "error"
         event.app.invalidate()
         return True
@@ -427,6 +467,9 @@ def do_switch(event):
         return
     if state["profiles"]:
         selected = state["profiles"][state["selected_index"]]
+        if state["tmp_mode"]:
+            event.app.exit(result=selected)   # main() pins it once the screen is gone
+            return
         switch_profile(selected)
         refresh_profiles()
         event.app.invalidate()
@@ -468,6 +511,8 @@ def do_add(event):
 
 def rename_flow(selected, ask=input, say=print):
     """Ask for a new name and apply it. Returns True if the profile moved."""
+    if refuse_pinned(selected):
+        return False
     say(f"=== RENAME PROFILE: {selected} ===\n")
     say("The account, conversations and settings all stay with the profile;")
     say("only its name changes.\n")
@@ -481,6 +526,8 @@ def rename_flow(selected, ask=input, say=print):
 
 def remove_flow(selected, ask=input, say=print):
     """Confirm a deletion, spelling out what is lost. Returns True if removed."""
+    if refuse_pinned(selected):
+        return False
     say(f"=== REMOVE PROFILE: {selected} ===\n")
     say(f"This deletes the credentials and settings of '{selected}'.")
     if sharing.is_shared(PROFILES_DIR, selected):
@@ -545,6 +592,8 @@ def enable_sharing_flow(selected, ask=input, say=print):
     `ask` and `say` are injected so the whole dialogue can be driven by tests
     without a terminal.
     """
+    if refuse_pinned(selected):
+        return False
     pool = sharing.pool_summary(PROFILES_DIR)
     say(f"=== SHARE DATA: {selected} ===\n")
     if pool is None:
@@ -592,6 +641,8 @@ def enable_sharing_flow(selected, ask=input, say=print):
 
 def disable_sharing_flow(selected, ask=input, say=print):
     """Ask what to keep, then take `selected` out of the pool."""
+    if refuse_pinned(selected):
+        return False
     pool = sharing.pool_summary(PROFILES_DIR)
     size = sharing.human_size(pool["bytes"]) if pool else "0 B"
     count = pool["conversations"] if pool else 0
@@ -678,6 +729,43 @@ def do_change_command(event):
     import asyncio
     asyncio.create_task(change_cmd_flow())
 
+def login_env(name):
+    """Login must land in the profile it runs for, never in the one a pinned
+    terminal happens to point CLAUDE_CONFIG_DIR at."""
+    if state["tmp_mode"]:
+        return tmp_mode.config_env(os.path.join(PROFILES_DIR, name), name)
+    return tmp_mode.global_env()
+
+def run_login(selected, run=subprocess.run, say=print):
+    """Get `selected` ready and run the login command for it.
+
+    The global mode activates the profile first. tmp mode leaves the global
+    profile alone and points CLAUDE_CONFIG_DIR at the selected one instead.
+    """
+    if state["tmp_mode"]:
+        say(f"Preparing '{selected}' for this terminal only...")
+        archive = prepare_tmp(selected)
+        if archive:
+            say(f"Kept a copy of the previous account files in {archive}")
+    else:
+        say(f"Making sure '{selected}' is active...")
+        switch_profile(selected)
+        refresh_profiles()
+
+    say(f"Running login command: {state['login_command']}")
+    say("-" * 40)
+    try:
+        # Run the login command interactively
+        run(state["login_command"], shell=True, check=True, env=login_env(selected))
+        say("-" * 40)
+        say("Login command finished successfully.")
+    except subprocess.CalledProcessError as e:
+        say("-" * 40)
+        say(f"Command failed with exit code {e.returncode}")
+    except Exception as e:
+        say("-" * 40)
+        say(f"Failed to execute command: {e}")
+
 @kb.add("l")
 def do_login(event):
     if refuse_unmanaged(event):
@@ -687,31 +775,14 @@ def do_login(event):
 
     selected = state["profiles"][state["selected_index"]]
     async def login_flow():
-        def run_login():
+        def run_it():
             print("\n" * 2)
             print(f"=== RUNNING LOGIN FOR PROFILE: {selected} ===")
-            print(f"Making sure '{selected}' is active...")
-            switch_profile(selected)
-            refresh_profiles()
-
-            print(f"Running login command: {state['login_command']}")
-            print("-" * 40)
-            try:
-                # Run the login command interactively
-                subprocess.run(state["login_command"], shell=True, check=True)
-                print("-" * 40)
-                print("Login command finished successfully.")
-            except subprocess.CalledProcessError as e:
-                print("-" * 40)
-                print(f"Command failed with exit code {e.returncode}")
-            except Exception as e:
-                print("-" * 40)
-                print(f"Failed to execute command: {e}")
-
+            run_login(selected)
             print("Press Enter to return to the TUI...")
             input()
 
-        await run_in_terminal(run_login)
+        await run_in_terminal(run_it)
         refresh_profiles()
         event.app.invalidate()
 
@@ -742,6 +813,12 @@ def get_screen_text():
         where = read_link(CLAUDE_JSON) if os.path.islink(CLAUDE_JSON) else "Not a symlink"
     tokens.append(("class:subtitle", f"{CLAUDE_JSON} -> {where}\n"))
     tokens.append(("", f" Login command: {state['login_command']}\n"))
+    if state["tmp_mode"]:
+        tokens.append(("class:info", " Mode: this terminal only\n"))
+    pinned_here = os.environ.get(tmp_mode.PROFILE_ENV)
+    if pinned_here:
+        tokens.append(("", " This terminal: "))
+        tokens.append(("class:shared", f"{pinned_here} (tmp)\n"))
     tokens.append(("", "\n"))
 
     # Profile List Table
@@ -776,6 +853,9 @@ def get_screen_text():
                 status_style = "class:inactive"
 
             status_text = "● ACTIVE" if is_active else "  inactive"
+            pins = state["pins"].get(name, 0)
+            if pins:
+                status_text += f" ◆{min(pins, 9)}"   # 13 columns at most
             is_sharing = state["sharing"].get(name, False)
             data_text = "⇄ shared" if is_sharing else "⊘ isolated"
             data_style = row_style if is_selected else (
@@ -807,7 +887,7 @@ def get_screen_text():
 
     # Help / Footer
     tokens.append(("class:help-key", " [Enter]"))
-    tokens.append(("class:help-desc", " Switch Profile  "))
+    tokens.append(("class:help-desc", " Use Here  " if state["tmp_mode"] else " Switch Profile  "))
     tokens.append(("class:help-key", " [A]"))
     tokens.append(("class:help-desc", " Add  "))
     tokens.append(("class:help-key", " [N]"))
@@ -825,7 +905,99 @@ def get_screen_text():
 
     return tokens
 
-def main():
+# tmp mode: one terminal pinned to one profile
+
+def tmp_refusal():
+    """Why this terminal cannot be pinned, or None."""
+    if IS_WINDOWS:
+        return "tmp mode is not supported on Windows yet."
+    pinned = os.environ.get(tmp_mode.PROFILE_ENV)
+    if pinned:
+        return f"This terminal already uses '{pinned}'. Type 'exit' first."
+    return None
+
+
+def prepare_tmp(name):
+    """Make a profile usable through CLAUDE_CONFIG_DIR.
+
+    Returns the directory where files were set aside, or None.
+    """
+    profile_dir = os.path.join(PROFILES_DIR, name)
+    linked = tmp_mode.link_account_json(profile_dir)
+    archive = linked["archive"]
+    if linked["promoted"] and sharing.is_shared(PROFILES_DIR, name):
+        # claude.json now comes from outside: adopt it instead of diffing it
+        # against the old baseline, which would strip the pool. Keep a copy
+        # of the pool first, so even a mistake here stays recoverable.
+        archive = archive or sharing.archive_dir(profile_dir)
+        os.makedirs(archive, exist_ok=True)
+        pool_config = os.path.join(sharing.pool_dir(PROFILES_DIR), "claude.shared.json")
+        if os.path.exists(pool_config):
+            shutil.copy2(pool_config, archive)
+        sharing.adopt_claude_json(PROFILES_DIR, name)
+    in_use = (name == state["active_profile"]
+              or bool(tmp_mode.live_pins(PROFILES_DIR).get(name)))
+    sharing.prepare_profile(PROFILES_DIR, name, in_use=in_use)
+    return archive
+
+
+def pin_here(name):
+    """Prepare `name`, register this terminal and exec into the pinned shell."""
+    archive = prepare_tmp(name)
+    tmp_mode.register_pin(PROFILES_DIR, name)
+    argv, env = tmp_mode.launch_command(os.path.join(PROFILES_DIR, name), name)
+    if archive:
+        print(f"Kept a copy of the previous account files in {archive}")
+    print(f"This terminal now uses profile '{name}'.")
+    if state["active_profile"]:
+        print(f"Type 'exit' to return to the global profile ('{state['active_profile']}').")
+    else:
+        print("Type 'exit' to leave.")
+    sys.stdout.flush()
+    tmp_mode.restore_signals()
+    os.execve(argv[0], argv, env)
+
+
+def run_tmp(name=None):
+    refusal = tmp_refusal()
+    if refusal is None:
+        refresh_profiles()   # migration, repair, dead pins, active profile
+        if os.path.lexists(CLAUDE_DIR) and not is_link(CLAUDE_DIR):
+            refusal = UNMANAGED
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 1
+    if name is None:
+        state["tmp_mode"] = True
+        name = run_tui()
+        if name is None:
+            return 0
+        refresh_profiles()   # the screen may have added, renamed or shared profiles
+    elif name not in state["profiles"]:
+        print(f"Profile '{name}' does not exist.", file=sys.stderr)
+        return 1
+    pin_here(name)
+    return 0
+
+
+def tmp_exit(name, pid):
+    """`_tmp-exit`: run by a pinned terminal's sh after its shell exits."""
+    try:
+        pid = int(pid)
+    except ValueError:
+        return 2
+    try:
+        tmp_mode.finish(PROFILES_DIR, name, pid)
+    except Exception as exc:
+        print(f"tui-claude: could not return '{name}' settings to the pool: {exc}",
+              file=sys.stderr)
+    back = linked_profile()
+    print(f"Back to the global profile '{back}'." if back else "Back to the global profile.")
+    return 0
+
+
+def run_tui():
+    """The full-screen TUI. Returns the profile picked in tmp mode, else None."""
     refresh_profiles()
     content = FormattedTextControl(get_screen_text)
     body = Window(content=content)
@@ -837,7 +1009,24 @@ def main():
         style=app_style,
         full_screen=True
     )
-    app.run()
+    return app.run()
+
+
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else list(argv)
+    if not args:
+        run_tui()
+        return 0
+    if args in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
+    if args[0] == "tmp" and len(args) <= 2:
+        return run_tmp(args[1] if len(args) == 2 else None)
+    if args[0] == "_tmp-exit" and len(args) == 3:
+        return tmp_exit(args[1], args[2])
+    print(USAGE, file=sys.stderr)
+    return 2
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

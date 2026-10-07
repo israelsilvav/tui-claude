@@ -518,3 +518,98 @@ def test_repair_promotes_when_the_profile_is_newer(profiles_dir):
 
     assert json.load(open(pool_file))["theme"] == "fresher"
     assert points_to(link, pool_file)
+
+
+# --- terminals pinned with `tui-claude tmp` ----------------------------------
+
+def _config(profiles_dir, name):
+    with open(os.path.join(profiles_dir, name, "claude.json")) as handle:
+        return json.load(handle)
+
+
+def _write_config(profiles_dir, name, data):
+    with open(os.path.join(profiles_dir, name, "claude.json"), "w") as handle:
+        json.dump(data, handle)
+
+
+def _pool_config(profiles_dir):
+    with open(os.path.join(sharing.pool_dir(profiles_dir), "claude.shared.json")) as handle:
+        return json.load(handle)
+
+
+def test_prepare_collects_before_rebuilding(profiles_dir):
+    """A pinned terminal closed without `exit` never reported back: its change
+    is still only in the profile, and a rebuild must not wipe it."""
+    make_profile(profiles_dir, "work", "w@example.net")
+    sharing.enable_sharing(profiles_dir, "work")
+    config = _config(profiles_dir, "work")
+    config["trustedFolder"] = True
+    _write_config(profiles_dir, "work", config)
+
+    sharing.prepare_profile(profiles_dir, "work", in_use=False)
+
+    assert _pool_config(profiles_dir)["trustedFolder"] is True
+    assert _config(profiles_dir, "work")["trustedFolder"] is True
+
+
+def test_prepare_does_not_rebuild_a_profile_in_use(profiles_dir):
+    make_profile(profiles_dir, "work", "w@example.net")
+    make_profile(profiles_dir, "personal", "p@example.org")
+    sharing.enable_sharing(profiles_dir, "work")
+    sharing.enable_sharing(profiles_dir, "personal")
+    config = _config(profiles_dir, "personal")
+    config["fromPersonal"] = 1
+    _write_config(profiles_dir, "personal", config)
+    sharing.split_claude_json(profiles_dir, "personal")
+    before = _config(profiles_dir, "work")
+
+    sharing.prepare_profile(profiles_dir, "work", in_use=True)
+
+    assert _config(profiles_dir, "work") == before, "a running session owns this file"
+    assert _pool_config(profiles_dir)["fromPersonal"] == 1
+
+
+def test_prepare_ignores_isolated_profiles(profiles_dir):
+    make_profile(profiles_dir, "client", "c@example.com", config={"own": 1})
+    before = _config(profiles_dir, "client")
+
+    sharing.prepare_profile(profiles_dir, "client", in_use=False)
+
+    assert _config(profiles_dir, "client") == before
+    assert not sharing.pool_exists(profiles_dir)
+
+
+def test_switch_does_not_rebuild_an_entering_profile_pinned_elsewhere(profiles_dir):
+    make_profile(profiles_dir, "a", "a@example.net")
+    make_profile(profiles_dir, "b", "b@example.net")
+    sharing.enable_sharing(profiles_dir, "a")
+    sharing.enable_sharing(profiles_dir, "b")
+    config_a = _config(profiles_dir, "a")
+    config_a["fromA"] = 1
+    _write_config(profiles_dir, "a", config_a)
+    before_b = _config(profiles_dir, "b")
+
+    sharing.sync_on_switch(profiles_dir, leaving="a", entering="b", entering_in_use=True)
+
+    assert _pool_config(profiles_dir)["fromA"] == 1, "leaving still hands its changes over"
+    assert _config(profiles_dir, "b") == before_b, "b is open in a pinned terminal"
+
+
+def test_save_json_temp_name_is_unique_per_process(profiles_dir, monkeypatch):
+    """Two pinned terminals of one profile can exit together and write the same
+    baseline; with a shared .tmp name one os.replace would find it gone."""
+    os.makedirs(profiles_dir)
+    target = os.path.join(profiles_dir, "x.json")
+    seen = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen.append(src)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(sharing.os, "replace", spy)
+
+    sharing.save_json(target, {"a": 1})
+
+    assert seen == [f"{target}.{os.getpid()}.tmp"]
+    assert sharing.load_json(target) == {"a": 1}
