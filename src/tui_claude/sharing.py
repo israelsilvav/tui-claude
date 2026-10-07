@@ -139,7 +139,9 @@ def load_json(path):
 
 
 def save_json(path, data):
-    tmp = path + ".tmp"
+    # Unique per process: two pinned terminals of one profile can exit at the
+    # same time and write the same baseline file.
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
     os.replace(tmp, path)
@@ -562,16 +564,32 @@ def repair_sharing(profiles_dir, profile):
     return repaired
 
 
-def sync_on_switch(profiles_dir, leaving, entering):
+def prepare_profile(profiles_dir, profile, in_use=False):
+    """Bring a profile's claude.json up to date before it is used.
+
+    Always collects first: a pinned terminal closed without `exit` never handed
+    its changes to the pool, and a rebuild would otherwise overwrite them. A
+    profile in use is not rebuilt at all: a running Claude Code holds
+    claude.json in memory and writes it back, and the next split would then
+    push those stale values into the pool as if they were changes.
+    """
+    if not profile or not is_shared(profiles_dir, profile):
+        return
+    split_claude_json(profiles_dir, profile)
+    if not in_use:
+        rebuild_claude_json(profiles_dir, profile)
+
+
+def sync_on_switch(profiles_dir, leaving, entering, entering_in_use=False):
     """Hand the pool the outgoing profile's config, then dress the incoming one.
 
-    Called at the moment the TUI flips the symlink, which is the only instant
-    where both profiles are known and neither is in use.
+    Called at the moment the TUI flips the symlink. The incoming profile may
+    already be open in a terminal pinned with `tui-claude tmp`; the caller
+    says so through `entering_in_use`.
     """
     if leaving and leaving != entering and is_shared(profiles_dir, leaving):
         split_claude_json(profiles_dir, leaving)
-    if entering and is_shared(profiles_dir, entering):
-        rebuild_claude_json(profiles_dir, entering)
+    prepare_profile(profiles_dir, entering, in_use=entering_in_use)
 
 
 def pool_summary(profiles_dir):
