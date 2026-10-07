@@ -2,8 +2,9 @@
 import contextlib
 import os
 import shutil
-import time
 import subprocess
+import sys
+import time
 from prompt_toolkit import Application
 from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.key_binding import KeyBindings
@@ -12,7 +13,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.styles import Style
 
-from . import sharing
+from . import sharing, tmp_mode
 from .links import IS_WINDOWS, is_link, link_dir, read_link, remove_link
 
 TEST_DIR = os.environ.get("TUI_CLAUDE_TEST_DIR")
@@ -41,6 +42,8 @@ state = {
     "message_style": "info",
     "sharing": {},       # profile name -> bool, read from the filesystem
     "pool": None,        # summary of the shared pool, or None if there is none
+    "pins": {},          # profile name -> terminals pinned with `tui-claude tmp`
+    "tmp_mode": False,   # True when started as `tui-claude tmp`
 }
 
 def init_profiles():
@@ -207,6 +210,10 @@ def refresh_profiles():
         state["message"] = f"Re-linked to the shared pool: {', '.join(sorted(set(healed)))}."
         state["message_style"] = "info"
 
+    # A pinned terminal closed without `exit` leaves its pin behind.
+    tmp_mode.clean_dead_pins(PROFILES_DIR)
+    state["pins"] = tmp_mode.live_pins(PROFILES_DIR)
+
     state["sharing"] = {name: sharing.is_shared(PROFILES_DIR, name)
                         for name in state["profiles"]}
     state["pool"] = sharing.pool_summary(PROFILES_DIR)
@@ -219,6 +226,17 @@ def refresh_profiles():
         state["selected_index"] = 0
     elif state["selected_index"] >= len(state["profiles"]):
         state["selected_index"] = len(state["profiles"]) - 1
+
+def refuse_pinned(name):
+    """A profile open in a pinned terminal must not move under it: its
+    CLAUDE_CONFIG_DIR would point at a path that no longer exists."""
+    count = tmp_mode.live_pins(PROFILES_DIR).get(name, 0)
+    if not count:
+        return False
+    state["message"] = (f"Profile '{name}' is in use by {count} terminal(s) (tmp). "
+                        "Type 'exit' in them first.")
+    state["message_style"] = "error"
+    return True
 
 def switch_profile(name):
     """Switch the active symlink to the chosen profile."""
@@ -233,7 +251,9 @@ def switch_profile(name):
         # hand the pool what the outgoing profile changed, then dress the
         # incoming one with it. No-op unless the profiles share.
         capture_live_json()
-        sharing.sync_on_switch(PROFILES_DIR, state["active_profile"], name)
+        sharing.sync_on_switch(
+            PROFILES_DIR, state["active_profile"], name,
+            entering_in_use=bool(tmp_mode.live_pins(PROFILES_DIR).get(name)))
 
         if os.path.lexists(CLAUDE_DIR):
             remove_link(CLAUDE_DIR)
@@ -302,6 +322,8 @@ def rename_profile(old, new):
         state["message"] = f"Profile '{old}' does not exist."
         state["message_style"] = "error"
         return False
+    if refuse_pinned(old):
+        return False
     if os.path.lexists(new_dir):
         state["message"] = f"Profile '{new}' already exists."
         state["message_style"] = "error"
@@ -338,6 +360,8 @@ def delete_profile(name):
     if not os.path.exists(profile_dir):
         state["message"] = f"Profile '{name}' does not exist."
         state["message_style"] = "error"
+        return False
+    if refuse_pinned(name):
         return False
 
     try:
@@ -468,6 +492,8 @@ def do_add(event):
 
 def rename_flow(selected, ask=input, say=print):
     """Ask for a new name and apply it. Returns True if the profile moved."""
+    if refuse_pinned(selected):
+        return False
     say(f"=== RENAME PROFILE: {selected} ===\n")
     say("The account, conversations and settings all stay with the profile;")
     say("only its name changes.\n")
@@ -481,6 +507,8 @@ def rename_flow(selected, ask=input, say=print):
 
 def remove_flow(selected, ask=input, say=print):
     """Confirm a deletion, spelling out what is lost. Returns True if removed."""
+    if refuse_pinned(selected):
+        return False
     say(f"=== REMOVE PROFILE: {selected} ===\n")
     say(f"This deletes the credentials and settings of '{selected}'.")
     if sharing.is_shared(PROFILES_DIR, selected):
@@ -545,6 +573,8 @@ def enable_sharing_flow(selected, ask=input, say=print):
     `ask` and `say` are injected so the whole dialogue can be driven by tests
     without a terminal.
     """
+    if refuse_pinned(selected):
+        return False
     pool = sharing.pool_summary(PROFILES_DIR)
     say(f"=== SHARE DATA: {selected} ===\n")
     if pool is None:
@@ -592,6 +622,8 @@ def enable_sharing_flow(selected, ask=input, say=print):
 
 def disable_sharing_flow(selected, ask=input, say=print):
     """Ask what to keep, then take `selected` out of the pool."""
+    if refuse_pinned(selected):
+        return False
     pool = sharing.pool_summary(PROFILES_DIR)
     size = sharing.human_size(pool["bytes"]) if pool else "0 B"
     count = pool["conversations"] if pool else 0
@@ -678,6 +710,13 @@ def do_change_command(event):
     import asyncio
     asyncio.create_task(change_cmd_flow())
 
+def login_env(name):
+    """Login must land in the profile it runs for, never in the one a pinned
+    terminal happens to point CLAUDE_CONFIG_DIR at."""
+    if state["tmp_mode"]:
+        return tmp_mode.config_env(os.path.join(PROFILES_DIR, name), name)
+    return tmp_mode.global_env()
+
 @kb.add("l")
 def do_login(event):
     if refuse_unmanaged(event):
@@ -698,7 +737,8 @@ def do_login(event):
             print("-" * 40)
             try:
                 # Run the login command interactively
-                subprocess.run(state["login_command"], shell=True, check=True)
+                subprocess.run(state["login_command"], shell=True, check=True,
+                               env=login_env(selected))
                 print("-" * 40)
                 print("Login command finished successfully.")
             except subprocess.CalledProcessError as e:

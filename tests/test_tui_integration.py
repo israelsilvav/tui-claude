@@ -3,10 +3,12 @@
 import importlib
 import json
 import os
+import subprocess
+import sys
 
 import pytest
 
-from tui_claude import sharing
+from tui_claude import sharing, tmp_mode
 
 
 @pytest.fixture
@@ -471,3 +473,122 @@ def test_remove_dialogue_reassures_when_shared(tui):
     tui.remove_flow("work", term.ask, term.say)
 
     assert "stay there" in term.screen, "shared conversations are not at risk"
+
+
+# --- terminals pinned with `tui-claude tmp` ----------------------------------
+
+def pin(tui, name, pid=None):
+    tmp_mode.register_pin(tui.PROFILES_DIR, name, os.getpid() if pid is None else pid)
+    tui.refresh_profiles()
+
+
+def test_refresh_counts_live_pins_and_cleans_dead_ones(tui):
+    tui.add_profile("work")
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    tmp_mode.register_pin(tui.PROFILES_DIR, "work", proc.pid)
+    pin(tui, "work")
+
+    assert tui.state["pins"] == {"work": 1}
+    assert os.listdir(tmp_mode.pins_dir(tui.PROFILES_DIR)) == [str(os.getpid())]
+
+
+def test_pins_directory_is_never_listed_as_a_profile(tui):
+    tui.add_profile("work")
+    pin(tui, "work")
+
+    assert tmp_mode.PINS_NAME not in tui.state["profiles"]
+
+
+def test_a_pinned_profile_cannot_be_renamed(tui):
+    tui.add_profile("work")
+    tui.add_profile("personal")
+    pin(tui, "work")
+
+    assert tui.rename_profile("work", "employer") is False
+    assert "is in use by 1 terminal(s) (tmp)" in tui.state["message"]
+    assert os.path.isdir(os.path.join(tui.PROFILES_DIR, "work"))
+
+
+def test_a_pinned_profile_cannot_be_removed(tui):
+    tui.add_profile("work")
+    tui.add_profile("personal")
+    pin(tui, "work")
+
+    assert tui.delete_profile("work") is False
+    assert os.path.isdir(os.path.join(tui.PROFILES_DIR, "work"))
+
+
+def test_other_profiles_stay_editable_while_one_is_pinned(tui):
+    tui.add_profile("work")
+    tui.add_profile("personal")
+    pin(tui, "work")
+
+    assert tui.rename_profile("personal", "home") is True
+
+
+def test_rename_and_remove_dialogues_refuse_before_asking(tui):
+    tui.add_profile("work")
+    tui.add_profile("personal")
+    pin(tui, "work")
+
+    for flow in (tui.rename_flow, tui.remove_flow):
+        term = FakeTerminal()   # no answers: asking anything would raise IndexError
+        assert flow("work", ask=term.ask, say=term.say) is False
+
+
+def test_sharing_a_pinned_profile_is_refused(tui):
+    tui.add_profile("work")
+    tui.add_profile("personal")
+    pin(tui, "work")
+
+    term = FakeTerminal()   # no answers: asking anything would raise IndexError
+    assert tui.enable_sharing_flow("work", ask=term.ask, say=term.say) is False
+    assert not sharing.is_shared(tui.PROFILES_DIR, "work")
+
+
+def test_isolating_a_pinned_profile_is_refused(tui):
+    # One pin per test: pin() uses this process's pid, and a second pin with
+    # the same pid would overwrite the first.
+    tui.add_profile("work")
+    tui.add_profile("personal")
+    sharing.enable_sharing(tui.PROFILES_DIR, "personal")
+    pin(tui, "personal")
+
+    term = FakeTerminal()
+    assert tui.disable_sharing_flow("personal", ask=term.ask, say=term.say) is False
+    assert sharing.is_shared(tui.PROFILES_DIR, "personal")
+
+
+def test_switching_to_a_profile_pinned_elsewhere_keeps_its_live_config(tui):
+    for name in ("a", "b"):
+        tui.add_profile(name)
+        with open(os.path.join(tui.PROFILES_DIR, name, "claude.json"), "w") as handle:
+            json.dump({"oauthAccount": {"emailAddress": f"{name}@example.net"}}, handle)
+        sharing.enable_sharing(tui.PROFILES_DIR, name)
+    tui.switch_profile("a")
+    pin(tui, "b")
+    config_a = json.load(open(tui.CLAUDE_JSON))
+    config_a["fromA"] = 1
+    json.dump(config_a, open(tui.CLAUDE_JSON, "w"))
+    config_b = os.path.join(tui.PROFILES_DIR, "b", "claude.json")
+    before = open(config_b).read()
+
+    tui.switch_profile("b")
+
+    assert open(config_b).read() == before, "b is open in a pinned terminal"
+
+
+def test_login_in_the_global_mode_ignores_an_inherited_config_dir(tui, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/pinned")
+
+    assert "CLAUDE_CONFIG_DIR" not in tui.login_env("work")
+
+
+def test_login_in_tmp_mode_targets_the_selected_profile(tui):
+    tui.add_profile("work")
+    tui.state["tmp_mode"] = True
+
+    env = tui.login_env("work")
+
+    assert env["CLAUDE_CONFIG_DIR"] == os.path.abspath(os.path.join(tui.PROFILES_DIR, "work"))
