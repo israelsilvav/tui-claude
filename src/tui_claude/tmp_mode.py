@@ -16,12 +16,15 @@ Nothing here depends on prompt_toolkit:
                    runs the user's shell and reports back when it exits
 """
 
+import contextlib
 import os
 import shutil
 
 from . import sharing
+from .links import IS_WINDOWS
 
 ACCOUNT_LINK = ".claude.json"
+PINS_NAME = "_pins"   # "_" keeps it out of the profile list
 
 
 def link_account_json(profile_dir):
@@ -55,3 +58,93 @@ def link_account_json(profile_dir):
 
     os.symlink("claude.json", link)
     return archived
+
+
+# --- pins ----------------------------------------------------------------------
+
+def pins_dir(profiles_dir):
+    return os.path.join(profiles_dir, PINS_NAME)
+
+
+def _start_time(pid):
+    """When the process started (Linux, /proc); None elsewhere.
+
+    A pid alone is not proof: once a pinned terminal dies, its pid can be
+    reused by an unrelated process. The start time tells the two apart.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+            stat = handle.read()
+    except OSError:
+        return None
+    # Field 2 (comm) is in parentheses and may contain spaces; field 22
+    # (starttime) is the 20th after the closing parenthesis.
+    return stat.rsplit(")", 1)[1].split()[19]
+
+
+def register_pin(profiles_dir, profile, pid=None):
+    """Record that terminal `pid` (default: this process) is pinned to `profile`.
+
+    Written just before exec, which keeps both the pid and its start time.
+    """
+    pid = os.getpid() if pid is None else pid
+    os.makedirs(pins_dir(profiles_dir), exist_ok=True)
+    path = os.path.join(pins_dir(profiles_dir), str(pid))
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"{profile}\n{_start_time(pid) or ''}\n")
+
+
+def remove_pin(profiles_dir, pid):
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(os.path.join(pins_dir(profiles_dir), str(pid)))
+
+
+def _alive(pid, start):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass   # alive, just not ours
+    return not start or _start_time(pid) == start
+
+
+def _scan(profiles_dir):
+    """(path, profile, alive) for each well-formed pin file."""
+    directory = pins_dir(profiles_dir)
+    # Never on Windows: tmp mode does not run there, and os.kill(pid, 0) would
+    # terminate the process instead of probing it.
+    if IS_WINDOWS or not os.path.isdir(directory):
+        return []
+    found = []
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        try:
+            pid = int(name)
+            if pid <= 0:
+                continue   # 0 and negatives address process groups
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except (ValueError, OSError):
+            continue
+        profile = lines[0] if lines else ""
+        start = lines[1] if len(lines) > 1 else ""
+        found.append((path, profile, bool(profile) and _alive(pid, start)))
+    return found
+
+
+def live_pins(profiles_dir):
+    """{profile: number of terminals pinned to it right now}."""
+    counts = {}
+    for _, profile, alive in _scan(profiles_dir):
+        if alive:
+            counts[profile] = counts.get(profile, 0) + 1
+    return counts
+
+
+def clean_dead_pins(profiles_dir):
+    """Drop pins left by terminals that were closed without `exit`."""
+    for path, _, alive in _scan(profiles_dir):
+        if not alive:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)
