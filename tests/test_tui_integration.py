@@ -1,14 +1,28 @@
 """Exercises main.py against a sandbox pointed at by TUI_CLAUDE_TEST_DIR."""
 
+import glob
 import importlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
 from tui_claude import sharing, tmp_mode
+
+
+@pytest.fixture(autouse=True)
+def keep_signal_dispositions():
+    """pin_here resets SIGPIPE/SIGXFSZ for the shell it execs; with execve
+    mocked out, that would otherwise leak into the test process."""
+    signals = [getattr(signal, n) for n in ("SIGPIPE", "SIGXFSZ") if hasattr(signal, n)]
+    saved = {s: signal.getsignal(s) for s in signals}
+    yield
+    for s, handler in saved.items():
+        signal.signal(s, handler)
 
 
 @pytest.fixture
@@ -760,3 +774,51 @@ def test_status_column_caps_the_count_at_nine(tui):
     screen = render(tui)
 
     assert "◆9" in screen and "◆12" not in screen
+
+
+# --- issues raised in the final review ---------------------------------------
+
+def test_a_stray_account_file_never_strips_the_shared_pool(tui, monkeypatch, capsys):
+    """Someone ran `CLAUDE_CONFIG_DIR=<profile> claude` by hand before tmp mode
+    linked .claude.json: Claude Code started from an empty config and wrote a
+    sparse, newer file. Taking it in must not read every key it lacks as a
+    deletion from the pool, which every shared profile is rebuilt from."""
+    monkeypatch.delenv("TUI_CLAUDE_PROFILE", raising=False)
+    for name in ("work", "personal"):
+        tui.add_profile(name)
+        with open(os.path.join(tui.PROFILES_DIR, name, "claude.json"), "w") as handle:
+            json.dump({"oauthAccount": {"emailAddress": f"{name}@example.net"},
+                       "projects": {"/home/u/a": {"t": 1}, "/home/u/b": {"t": 1}},
+                       "mcpServers": {"x": {}}, "theme": "dark"}, handle)
+        sharing.enable_sharing(tui.PROFILES_DIR, name)
+    stray = os.path.join(tui.PROFILES_DIR, "work", ".claude.json")
+    with open(stray, "w") as handle:
+        json.dump({"oauthAccount": {"emailAddress": "work@example.net", "fresh": True},
+                   "numStartups": 1, "projects": {"/home/u/c": {"t": 1}}}, handle)
+    future = time.time() + 60
+    os.utime(stray, (future, future))
+    monkeypatch.setattr(tui.os, "execve", lambda *a: None)
+
+    tui.main(["tmp", "work"])
+
+    pool = sharing.load_json(os.path.join(sharing.pool_dir(tui.PROFILES_DIR),
+                                          "claude.shared.json"))
+    assert {"/home/u/a", "/home/u/b"} <= set(pool["projects"])
+    assert pool["mcpServers"] == {"x": {}}
+    assert pool["theme"] == "dark"
+    work = sharing.load_json(os.path.join(tui.PROFILES_DIR, "work", "claude.json"))
+    assert work["oauthAccount"]["fresh"] is True, "the newer login is kept"
+    archives = glob.glob(os.path.join(tui.PROFILES_DIR, "work", "_archive-*"))
+    assert any(os.path.exists(os.path.join(a, "claude.shared.json")) for a in archives), \
+        "the pool is backed up before a foreign file is taken in"
+    assert "Kept a copy of" in capsys.readouterr().out
+
+
+def test_adding_a_profile_in_tmp_mode_keeps_the_global_one(tui):
+    tui.add_profile("personal")
+    tui.state["tmp_mode"] = True
+
+    assert tui.add_profile("client") is True
+
+    assert tui.linked_profile() == "personal", "tmp mode never moves the global profile"
+    assert os.path.isdir(os.path.join(tui.PROFILES_DIR, "client"))

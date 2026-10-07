@@ -277,8 +277,14 @@ def switch_profile(name):
         state["message_style"] = "error"
         return False
 
-def add_profile(name, share=False):
-    """Create a new profile folder, optionally joining the shared pool."""
+def add_profile(name, share=False, activate=None):
+    """Create a new profile folder, optionally joining the shared pool.
+
+    It becomes the global profile unless `activate` says otherwise; by
+    default tmp mode leaves the global profile alone.
+    """
+    if activate is None:
+        activate = not state["tmp_mode"]
     name = "".join([c for c in name if c.isalnum() or c in ("-", "_")]).strip()
     name = name.lstrip("_")  # "_" is reserved for internals
     if not name:
@@ -296,9 +302,12 @@ def add_profile(name, share=False):
         os.makedirs(profile_dir, exist_ok=True)
         if share:
             sharing.enable_sharing(PROFILES_DIR, name)
-        switch_profile(name)
         where = "sharing data" if share else "with its own data"
-        state["message"] = f"Created and activated profile '{name}' ({where})."
+        if activate:
+            switch_profile(name)
+            state["message"] = f"Created and activated profile '{name}' ({where})."
+        else:
+            state["message"] = f"Created profile '{name}' ({where})."
         state["message_style"] = "success"
         return True
     except Exception as e:
@@ -396,7 +405,7 @@ def delete_profile(name):
             if state["profiles"]:
                 switch_profile(state["profiles"][0])
             else:
-                add_profile("default")
+                add_profile("default", activate=True)   # ~/.claude must point somewhere
         return True
     except Exception as e:
         state["message"] = f"Failed to delete profile: {e}"
@@ -735,7 +744,9 @@ def run_login(selected, run=subprocess.run, say=print):
     """
     if state["tmp_mode"]:
         say(f"Preparing '{selected}' for this terminal only...")
-        prepare_tmp(selected)
+        archive = prepare_tmp(selected)
+        if archive:
+            say(f"Kept a copy of the previous account files in {archive}")
     else:
         say(f"Making sure '{selected}' is active...")
         switch_profile(selected)
@@ -907,24 +918,43 @@ def tmp_refusal():
 
 
 def prepare_tmp(name):
-    """Make a profile usable through CLAUDE_CONFIG_DIR."""
-    tmp_mode.link_account_json(os.path.join(PROFILES_DIR, name))
+    """Make a profile usable through CLAUDE_CONFIG_DIR.
+
+    Returns the directory where files were set aside, or None.
+    """
+    profile_dir = os.path.join(PROFILES_DIR, name)
+    linked = tmp_mode.link_account_json(profile_dir)
+    archive = linked["archive"]
+    if linked["promoted"] and sharing.is_shared(PROFILES_DIR, name):
+        # claude.json now comes from outside: adopt it instead of diffing it
+        # against the old baseline, which would strip the pool. Keep a copy
+        # of the pool first, so even a mistake here stays recoverable.
+        archive = archive or sharing.archive_dir(profile_dir)
+        os.makedirs(archive, exist_ok=True)
+        pool_config = os.path.join(sharing.pool_dir(PROFILES_DIR), "claude.shared.json")
+        if os.path.exists(pool_config):
+            shutil.copy2(pool_config, archive)
+        sharing.adopt_claude_json(PROFILES_DIR, name)
     in_use = (name == state["active_profile"]
               or bool(tmp_mode.live_pins(PROFILES_DIR).get(name)))
     sharing.prepare_profile(PROFILES_DIR, name, in_use=in_use)
+    return archive
 
 
 def pin_here(name):
     """Prepare `name`, register this terminal and exec into the pinned shell."""
-    prepare_tmp(name)
+    archive = prepare_tmp(name)
     tmp_mode.register_pin(PROFILES_DIR, name)
     argv, env = tmp_mode.launch_command(os.path.join(PROFILES_DIR, name), name)
+    if archive:
+        print(f"Kept a copy of the previous account files in {archive}")
     print(f"This terminal now uses profile '{name}'.")
     if state["active_profile"]:
         print(f"Type 'exit' to return to the global profile ('{state['active_profile']}').")
     else:
         print("Type 'exit' to leave.")
     sys.stdout.flush()
+    tmp_mode.restore_signals()
     os.execve(argv[0], argv, env)
 
 

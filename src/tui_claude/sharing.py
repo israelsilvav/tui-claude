@@ -341,12 +341,15 @@ def apply_delta(target, sets, deletes):
     return target
 
 
-def split_claude_json(profiles_dir, profile):
+def split_claude_json(profiles_dir, profile, push=True):
     """Push this profile's shareable config into the pool, keep identity local.
 
     Writes a delta against the baseline saved at the last rebuild rather than
     overwriting, so two profiles that changed different keys do not erase each
     other. Returns the list of keys withheld by the identity guard.
+
+    With push=False the pool is left alone: only the account split and the
+    baseline are written (see adopt_claude_json).
     """
     profile_path = os.path.join(profiles_dir, profile)
     data = load_json(os.path.join(profile_path, "claude.json"))
@@ -380,17 +383,30 @@ def split_claude_json(profiles_dir, profile):
             else:
                 common[key] = value
 
-        if os.path.exists(baseline_path):
-            sets, deletes = compute_delta(load_json(baseline_path), common)
-            shared = apply_delta(shared, sets, deletes)
-        else:
-            shared.update(common)  # first time: nothing to diff against
-
-        save_json(shared_path, shared)
+        if push:
+            if os.path.exists(baseline_path):
+                sets, deletes = compute_delta(load_json(baseline_path), common)
+                shared = apply_delta(shared, sets, deletes)
+            else:
+                shared.update(common)  # first time: nothing to diff against
+            save_json(shared_path, shared)
 
     save_json(account_path, account)
     save_json(baseline_path, common)
     return withheld
+
+
+def adopt_claude_json(profiles_dir, profile):
+    """Take the profile's claude.json as it is now, without touching the pool.
+
+    For a claude.json that was replaced from outside, such as a .claude.json
+    Claude Code wrote under CLAUDE_CONFIG_DIR before tmp mode linked it. Such
+    a file starts from an empty config, so diffing it against the old
+    baseline would read every key it lacks as a deletion and strip it from
+    the pool for every profile. Adopting it keeps its identity and makes it
+    the new baseline; the next rebuild dresses it with the pool again.
+    """
+    return split_claude_json(profiles_dir, profile, push=False)
 
 
 def rebuild_claude_json(profiles_dir, profile):

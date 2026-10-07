@@ -35,7 +35,7 @@ def read(path):
 def test_account_link_is_created_relative(profile_dir):
     write(os.path.join(profile_dir, "claude.json"), {"userID": "u"})
 
-    assert tmp_mode.link_account_json(profile_dir) is None
+    assert tmp_mode.link_account_json(profile_dir) == {"archive": None, "promoted": False}
 
     link = os.path.join(profile_dir, ".claude.json")
     assert os.readlink(link) == "claude.json", "relative, so a rename keeps it valid"
@@ -78,11 +78,12 @@ def test_newer_real_account_file_wins_and_the_older_is_archived(profile_dir):
     write(new, {"version": "new"})
     os.utime(old, (time.time() - 60, time.time() - 60))
 
-    archived = tmp_mode.link_account_json(profile_dir)
+    result = tmp_mode.link_account_json(profile_dir)
 
+    assert result["promoted"] is True
     assert read(old) == {"version": "new"}
     assert os.readlink(new) == "claude.json"
-    assert read(os.path.join(archived, "claude.json")) == {"version": "old"}
+    assert read(os.path.join(result["archive"], "claude.json")) == {"version": "old"}
 
 
 def test_older_real_account_file_is_archived(profile_dir):
@@ -92,16 +93,18 @@ def test_older_real_account_file_is_archived(profile_dir):
     write(stale, {"version": "stale"})
     os.utime(stale, (time.time() - 60, time.time() - 60))
 
-    archived = tmp_mode.link_account_json(profile_dir)
+    result = tmp_mode.link_account_json(profile_dir)
 
+    assert result["promoted"] is False
     assert read(current) == {"version": "current"}
-    assert read(os.path.join(archived, ".claude.json")) == {"version": "stale"}
+    assert read(os.path.join(result["archive"], ".claude.json")) == {"version": "stale"}
 
 
 def test_real_account_file_alone_becomes_claude_json(profile_dir):
     write(os.path.join(profile_dir, ".claude.json"), {"only": 1})
 
-    assert tmp_mode.link_account_json(profile_dir) is None, "nothing to archive"
+    assert tmp_mode.link_account_json(profile_dir) == {"archive": None, "promoted": True}, \
+        "nothing to archive, but claude.json now comes from outside"
     assert read(os.path.join(profile_dir, "claude.json")) == {"only": 1}
 
 
@@ -241,7 +244,7 @@ def test_launch_runs_the_user_shell_then_reports_back(profile_dir):
 
     assert argv[:2] == ["/bin/sh", "-c"]
     assert argv[3:] == ["tui-claude-tmp", "/bin/zsh", sys.executable, "work"]
-    assert '"$2" -m tui_claude.main _tmp-exit "$3" "$$"' in argv[2]
+    assert '"$2" -P -m tui_claude.main _tmp-exit "$3" "$$"' in argv[2]
     assert env["CLAUDE_CONFIG_DIR"] == os.path.abspath(profile_dir)
     assert env["TUI_CLAUDE_PROFILE"] == "work"
 
@@ -296,6 +299,7 @@ FAKE_SHELL = """#!/bin/sh
   echo "CONFIG=$CLAUDE_CONFIG_DIR"
   echo "PROFILE=$TUI_CLAUDE_PROFILE"
   echo "PINS=$(ls "$PINS_DIR" | tr '\\n' ' ')"
+  echo "SIGIGN=$(grep SigIgn /proc/self/status 2>/dev/null | awk '{print $2}')"
 } > "$REPORT"
 "$PY" -c '
 import json, os
@@ -353,10 +357,37 @@ def test_tmp_end_to_end(sandbox, tmp_path):
     assert "PROFILE=work" in lines
     pins_line = next(line for line in lines if line.startswith("PINS="))
     assert pins_line.split("=", 1)[1].strip().isdigit(), "exactly one pin while inside"
+    ignored = next(line for line in lines if line.startswith("SIGIGN=")).split("=", 1)[1]
+    if ignored:   # Linux: /proc/self/status of a command run inside the pinned shell
+        mask = int(ignored, 16)
+        assert not mask & (1 << 12), "SIGPIPE must not stay ignored (`cmd | head` never ends)"
+        assert not mask & (1 << 24), "SIGXFSZ must not stay ignored"
     assert os.listdir(tmp_mode.pins_dir(sandbox.PROFILES_DIR)) == [], "gone after exit"
     pool = read(os.path.join(sharing.pool_dir(sandbox.PROFILES_DIR), "claude.shared.json"))
     assert pool["trustedInPinnedTerminal"] is True
     assert "This terminal now uses profile 'work'." in proc.stdout
+    assert "Back to the global profile 'personal'." in proc.stdout
+
+
+def test_exit_hook_ignores_modules_in_the_current_directory(sandbox, tmp_path):
+    """python -m puts the cwd first on sys.path: a json.py in the directory
+    where `tmp` was typed must not run when the pinned terminal exits."""
+    project = tmp_path / "project"
+    project.mkdir()
+    marker = tmp_path / "hijacked"
+    (project / "json.py").write_text(
+        f"open({str(marker)!r}, 'w').close()\nraise SystemExit('hijacked')\n")
+    shell = tmp_path / "exit0.sh"
+    shell.write_text("#!/bin/sh\nexit 0\n")
+    shell.chmod(0o755)
+
+    # -P keeps the launcher itself away from the cwd: only the hook is on trial.
+    proc = subprocess.run([sys.executable, "-P", "-m", "tui_claude.main", "tmp", "work"],
+                          cwd=str(project), env=cli_env(sandbox, SHELL=str(shell)),
+                          capture_output=True, text=True, timeout=60)
+
+    assert not marker.exists(), "the exit hook imported json.py from the cwd"
+    assert os.listdir(tmp_mode.pins_dir(sandbox.PROFILES_DIR)) == []
     assert "Back to the global profile 'personal'." in proc.stdout
 
 

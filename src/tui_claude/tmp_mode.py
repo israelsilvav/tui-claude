@@ -19,6 +19,7 @@ Nothing here depends on prompt_toolkit:
 import contextlib
 import os
 import shutil
+import signal
 import sys
 
 from . import sharing
@@ -32,17 +33,22 @@ PROFILE_ENV = "TUI_CLAUDE_PROFILE"
 # sh waits for the user's shell, then calls back so the profile's config goes
 # to the pool. `trap :` (a no-op handler, not `trap ''`) keeps sh alive through
 # Ctrl-C without the shell and everything it starts inheriting an ignored
-# SIGINT. The shell's exit status is passed on.
+# SIGINT. The shell's exit status is passed on. -P keeps the directory where
+# `tmp` was typed off sys.path: a json.py there must not run on exit.
 EXIT_SCRIPT = """trap : INT QUIT
 "$1"
 rc=$?
-"$2" -m tui_claude.main _tmp-exit "$3" "$$"
+"$2" -P -m tui_claude.main _tmp-exit "$3" "$$"
 exit $rc
 """
 
 
 def link_account_json(profile_dir):
-    """Point <profile>/.claude.json at claude.json; return an archive dir or None.
+    """Point <profile>/.claude.json at claude.json.
+
+    Returns {"archive": dir or None, "promoted": bool}: where a file set aside
+    went, and whether claude.json was replaced by a file from outside — which
+    the caller must not diff against the old baseline (see main.prepare_tmp).
 
     The link is relative, so renaming the profile keeps it valid. Claude Code
     writes through it: its atomic write lands next to the real file, so the
@@ -50,13 +56,13 @@ def link_account_json(profile_dir):
     """
     link = os.path.join(profile_dir, ACCOUNT_LINK)
     target = os.path.join(profile_dir, "claude.json")
+    result = {"archive": None, "promoted": False}
 
     if os.path.islink(link):
         if os.readlink(link) == "claude.json":
-            return None
+            return result
         os.unlink(link)
 
-    archived = None
     if os.path.lexists(link):
         # A real file: Claude Code ran with CLAUDE_CONFIG_DIR on this profile
         # before the link existed. Keep the newer copy, archive the other.
@@ -64,14 +70,15 @@ def link_account_json(profile_dir):
                       or os.path.getmtime(link) > os.path.getmtime(target))
         older = target if link_newer else link
         if os.path.exists(older):
-            archived = sharing.archive_dir(profile_dir)
-            os.makedirs(archived, exist_ok=True)
-            shutil.move(older, os.path.join(archived, os.path.basename(older)))
+            result["archive"] = sharing.archive_dir(profile_dir)
+            os.makedirs(result["archive"], exist_ok=True)
+            shutil.move(older, os.path.join(result["archive"], os.path.basename(older)))
         if link_newer:
             shutil.move(link, target)
+            result["promoted"] = True
 
     os.symlink("claude.json", link)
-    return archived
+    return result
 
 
 # --- pins ----------------------------------------------------------------------
@@ -202,3 +209,16 @@ def finish(profiles_dir, profile, pid):
             sharing.split_claude_json(profiles_dir, profile)
     finally:
         remove_pin(profiles_dir, pid)
+
+
+def restore_signals():
+    """Give the pinned shell the signal dispositions a shell normally starts with.
+
+    CPython ignores SIGPIPE and SIGXFSZ at startup, and an ignored signal
+    survives exec: without this the pinned shell, and everything started from
+    it, would ignore SIGPIPE, and `producer | head` would never stop.
+    subprocess does the same with restore_signals=True.
+    """
+    for name in ("SIGPIPE", "SIGXFSZ"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), signal.SIG_DFL)
