@@ -822,3 +822,86 @@ def test_adding_a_profile_in_tmp_mode_keeps_the_global_one(tui):
 
     assert tui.linked_profile() == "personal", "tmp mode never moves the global profile"
     assert os.path.isdir(os.path.join(tui.PROFILES_DIR, "client"))
+
+
+# --- the _active link ----------------------------------------------------------
+
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX only")
+
+
+def active_link(tui):
+    return os.path.join(tui.PROFILES_DIR, tui.ACTIVE_LINK)
+
+
+@posix_only
+def test_active_link_follows_the_global_profile(tui):
+    assert os.readlink(active_link(tui)) == "default", "relative, set on the first run"
+    assert tui.ACTIVE_LINK not in tui.state["profiles"]
+
+    tui.add_profile("work")   # activates it
+    assert os.readlink(active_link(tui)) == "work"
+    tui.switch_profile("default")
+    assert os.readlink(active_link(tui)) == "default"
+
+
+@posix_only
+def test_active_link_leads_to_the_same_account_file(tui):
+    tui.add_profile("work")
+    with open(os.path.join(tui.PROFILES_DIR, "work", "claude.json"), "w") as f:
+        f.write('{"userID": "work"}')
+
+    assert os.path.samefile(os.path.join(active_link(tui), "claude.json"), tui.CLAUDE_JSON)
+
+
+@posix_only
+def test_active_link_resolves_where_the_directory_is_mounted(tui, tmp_path):
+    tui.add_profile("work")
+    mounted = os.path.join(tmp_path, "elsewhere")
+    os.rename(tui.PROFILES_DIR, mounted)
+
+    assert os.path.realpath(os.path.join(mounted, tui.ACTIVE_LINK)) == \
+        os.path.realpath(os.path.join(mounted, "work"))
+
+
+@posix_only
+def test_active_link_follows_a_rename(tui):
+    tui.add_profile("work")
+    tui.refresh_profiles()
+
+    tui.rename_profile("work", "employer")
+
+    assert os.readlink(active_link(tui)) == "employer"
+
+
+@posix_only
+def test_active_link_follows_the_fallback_when_the_active_profile_is_deleted(tui):
+    tui.add_profile("work")
+    tui.refresh_profiles()
+
+    tui.delete_profile("work")
+
+    assert os.readlink(active_link(tui)) == tui.linked_profile() == "default"
+
+
+@posix_only
+def test_refresh_creates_or_corrects_the_active_link(tui):
+    os.unlink(active_link(tui))   # installed before the link existed
+    tui.refresh_profiles()
+    assert os.readlink(active_link(tui)) == "default"
+
+    os.unlink(active_link(tui))
+    os.symlink("gone", active_link(tui))
+    tui.refresh_profiles()
+    assert os.readlink(active_link(tui)) == "default"
+
+
+@posix_only
+def test_a_real_file_named_active_is_left_alone(tui):
+    os.unlink(active_link(tui))
+    os.mkdir(active_link(tui))
+
+    tui.add_profile("work")
+    tui.refresh_profiles()
+
+    assert os.path.isdir(active_link(tui)) and not os.path.islink(active_link(tui))
+    assert tui.linked_profile() == "work", "the switch itself still happens"
