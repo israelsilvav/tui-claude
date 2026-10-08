@@ -54,6 +54,9 @@ usage: tui-claude            manage profiles; Enter switches the global profile
 UNMANAGED = ("~/.claude has not been migrated yet. Close every "
              "Claude Code session and restart tui-claude.")
 
+# <profiles>/_active -> <global profile>. "_" keeps it out of the profile list.
+ACTIVE_LINK = "_active"
+
 def init_profiles():
     """Ensure the profile directories exist and migrate existing ~/.claude directory."""
     if not os.path.exists(PROFILES_DIR):
@@ -169,6 +172,37 @@ def linked_profile():
         return None
     return name
 
+def point_active_link(name):
+    """Point <profiles>/_active at the global profile, or remove it for None.
+
+    ~/.claude and ~/.claude.json live outside the profiles directory, so
+    anything that sees only that directory — a dev container that mounts it —
+    cannot follow a switch. This link lives inside it and is relative, so it
+    resolves wherever the directory is mounted: link ~/.claude to _active and
+    ~/.claude.json to _active/claude.json there.
+
+    POSIX only: a junction cannot be relative. A real file or directory under
+    the name is never touched.
+    """
+    if IS_WINDOWS:
+        return
+    link = os.path.join(PROFILES_DIR, ACTIVE_LINK)
+    if os.path.lexists(link) and not os.path.islink(link):
+        return
+    if name is None:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(link)
+        return
+    if os.path.islink(link) and os.readlink(link) == name:
+        return
+    # Replace, never unlink then create: a reader in between would find no
+    # profile at all.
+    tmp = f"{link}.tmp"
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(tmp)
+    os.symlink(name, tmp)
+    os.replace(tmp, link)
+
 def capture_live_json():
     """Copy mode: save the live ~/.claude.json back into its profile.
 
@@ -229,6 +263,14 @@ def refresh_profiles():
     # Find active profile
     state["active_profile"] = linked_profile()
 
+    # Also covers a first run, an upgrade and the removal of the active profile.
+    try:
+        point_active_link(state["active_profile"])
+    except OSError as e:
+        if not state["message"]:
+            state["message"] = f"Could not update {ACTIVE_LINK}: {e}"
+            state["message_style"] = "error"
+
     # Normalize selection index
     if not state["profiles"]:
         state["selected_index"] = 0
@@ -268,6 +310,7 @@ def switch_profile(name):
         link_dir(profile_dir, CLAUDE_DIR)
 
         place_live_json(profile_dir)
+        point_active_link(name)
 
         state["message"] = f"Switched to profile '{name}'."
         state["message_style"] = "success"
@@ -361,6 +404,7 @@ def rename_profile(old, new):
                 remove_link(CLAUDE_DIR)
             link_dir(new_dir, CLAUDE_DIR)
             place_live_json(new_dir)
+            point_active_link(new)
             state["active_profile"] = new
 
         state["message"] = f"Renamed '{old}' to '{new}'."

@@ -131,6 +131,32 @@ PS1='${TUI_CLAUDE_PROFILE:+(claude:$TUI_CLAUDE_PROFILE) }'"$PS1"
 > pinned profile in a separate Keychain entry: log in once with `L` inside
 > `tui-claude tmp`.
 
+### Dev containers
+
+Bind-mounting `~/.claude` and `~/.claude.json` into a container does not
+follow a switch: Docker resolves the symlinks when the container starts, so
+the container keeps the account that was active then.
+
+Mount the profiles directory instead, **at the same path as on the host**, and
+point the container at `_active`, a link `tui-claude` keeps on the global
+profile:
+
+```jsonc
+// .devcontainer/devcontainer.json
+"mounts": [
+  "source=${localEnv:HOME}/.claude-profiles,target=${localEnv:HOME}/.claude-profiles,type=bind"
+],
+"postCreateCommand": "ln -sfn ${localEnv:HOME}/.claude-profiles/_active ~/.claude && ln -sfn ${localEnv:HOME}/.claude-profiles/_active/claude.json ~/.claude.json"
+```
+
+Remove any mount of `~/.claude` or `~/.claude.json`: a mounted file cannot be
+replaced by a link (`Device or resource busy`). The same path matters because
+a shared profile links into the pool by absolute path.
+
+Switch on the host; every `claude` started in the container afterwards uses
+the new account. Do not run `tui-claude` inside the container: its pins are
+process ids, and the two sides cannot see each other's processes.
+
 ## How it works
 
 Claude Code always reads from two fixed paths. `tui-claude` points them at the profile you selected:
@@ -209,9 +235,11 @@ An atomic write — write to `.tmp`, rename over the target — replaces a symli
 
     _pins/                        one file per terminal pinned with `tmp`
 
+    _active         -> work       the global profile, for dev containers
+
     work/                         a shared profile
-        projects        -> ../_shared/projects
-        settings.json   -> ../_shared/settings.json
+        projects        -> ~/.claude-profiles/_shared/projects
+        settings.json   -> ~/.claude-profiles/_shared/settings.json
         .credentials.json         real file, never shared
         claude.account.json       identity split out of claude.json
         claude.baseline.json      what the pool looked like at the last switch
