@@ -544,7 +544,12 @@ def repair_sharing(profiles_dir, profile):
     pool = pool_dir(profiles_dir)
     repaired = []
 
+    proxy_client = load_json(os.path.join(profiles_dir, "_proxy", "client.json"))
+    proxied_settings = (proxy_client.get("profile") == profile)
+
     for name in SHARED_DIRS + SHARED_FILES:
+        if name == "settings.json" and proxied_settings:
+            continue
         local = os.path.join(profile_path, name)
         target = os.path.join(pool, name)
         if is_link(local) or points_to(local, target) or not os.path.exists(local):
