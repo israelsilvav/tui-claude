@@ -13,7 +13,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.styles import Style
 
-from . import sharing, tmp_mode
+from . import proxy, sharing, tmp_mode
 from .links import IS_WINDOWS, is_link, link_dir, read_link, remove_link
 
 TEST_DIR = os.environ.get("TUI_CLAUDE_TEST_DIR")
@@ -44,12 +44,20 @@ state = {
     "pool": None,        # summary of the shared pool, or None if there is none
     "pins": {},          # profile name -> terminals pinned with `tui-claude tmp`
     "tmp_mode": False,   # True when started as `tui-claude tmp`
+    "proxy_mode": False, # True when picking a profile for `tui-claude proxy`
+    "proxies": {"server": None, "client": None},
 }
 
 USAGE = """\
 usage: tui-claude            manage profiles; Enter switches the global profile
        tui-claude tmp        pick a profile for this terminal only
-       tui-claude tmp NAME   use profile NAME in this terminal only"""
+       tui-claude tmp NAME   use profile NAME in this terminal only
+       tui-claude proxy server [NAME] [opts]   serve a profile's credentials over Tailscale
+       tui-claude proxy client <HOST> [opts]   connect a profile to a remote proxy server
+       tui-claude proxy status                 show running proxy server/client
+       tui-claude proxy stop [server|client]   stop proxy daemon(s) and restore profile
+       tui-claude proxy logs [server|client]   show daemon log output
+       tui-claude proxy --help                 detailed proxy options"""
 
 UNMANAGED = ("~/.claude has not been migrated yet. Close every "
              "Claude Code session and restart tui-claude.")
@@ -207,6 +215,10 @@ def refresh_profiles():
                 profiles.append(name)
     state["profiles"] = sorted(profiles)
 
+    # Clean up any crashed proxy process before repair_sharing runs, so a
+    # detached proxy settings.json is restored rather than promoted to _shared.
+    proxy.clean_dead_proxies(PROFILES_DIR)
+
     # An atomic write by Claude Code can replace a symlink with a real file,
     # dropping that one item out of the pool without raising anything. Repair
     # first, then read the state: repairs promote content into the pool and
@@ -221,6 +233,7 @@ def refresh_profiles():
     # A pinned terminal closed without `exit` leaves its pin behind.
     tmp_mode.clean_dead_pins(PROFILES_DIR)
     state["pins"] = tmp_mode.live_pins(PROFILES_DIR)
+    state["proxies"] = proxy.active_proxies(PROFILES_DIR)
 
     state["sharing"] = {name: sharing.is_shared(PROFILES_DIR, name)
                         for name in state["profiles"]}
@@ -467,8 +480,8 @@ def do_switch(event):
         return
     if state["profiles"]:
         selected = state["profiles"][state["selected_index"]]
-        if state["tmp_mode"]:
-            event.app.exit(result=selected)   # main() pins it once the screen is gone
+        if state["tmp_mode"] or state["proxy_mode"]:
+            event.app.exit(result=selected)   # caller acts on it once the screen is gone
             return
         switch_profile(selected)
         refresh_profiles()
@@ -815,10 +828,21 @@ def get_screen_text():
     tokens.append(("", f" Login command: {state['login_command']}\n"))
     if state["tmp_mode"]:
         tokens.append(("class:info", " Mode: this terminal only\n"))
+    if state["proxy_mode"]:
+        tokens.append(("class:info", " Mode: select profile for proxy\n"))
     pinned_here = os.environ.get(tmp_mode.PROFILE_ENV)
     if pinned_here:
         tokens.append(("", " This terminal: "))
         tokens.append(("class:shared", f"{pinned_here} (tmp)\n"))
+    proxies = state.get("proxies") or {}
+    if proxies.get("server"):
+        srv = proxies["server"]
+        tokens.append(("", " Proxy server: "))
+        tokens.append(("class:active", f"● {srv['profile']} (http://{srv['host']}:{srv['port']})\n"))
+    if proxies.get("client"):
+        cli = proxies["client"]
+        tokens.append(("", " Proxy client: "))
+        tokens.append(("class:shared", f"● {cli['profile']} (http://{cli['host']}:{cli['port']} -> {cli['upstream']})\n"))
     tokens.append(("", "\n"))
 
     # Profile List Table
@@ -886,8 +910,13 @@ def get_screen_text():
         tokens.append(("", "\n"))
 
     # Help / Footer
+    enter_desc = (
+        " Use Here  " if state["tmp_mode"] else
+        " Select Profile  " if state["proxy_mode"] else
+        " Switch Profile  "
+    )
     tokens.append(("class:help-key", " [Enter]"))
-    tokens.append(("class:help-desc", " Use Here  " if state["tmp_mode"] else " Switch Profile  "))
+    tokens.append(("class:help-desc", enter_desc))
     tokens.append(("class:help-key", " [A]"))
     tokens.append(("class:help-desc", " Add  "))
     tokens.append(("class:help-key", " [N]"))
@@ -1012,6 +1041,302 @@ def run_tui():
     return app.run()
 
 
+def pick_profile_for_proxy(explicit_name=None):
+    """Resolve `explicit_name` or open the TUI picker for proxy commands."""
+    refresh_profiles()
+    if os.path.lexists(CLAUDE_DIR) and not is_link(CLAUDE_DIR):
+        print(UNMANAGED, file=sys.stderr)
+        return None, 1
+    if explicit_name is None:
+        state["proxy_mode"] = True
+        try:
+            picked = run_tui()
+        finally:
+            state["proxy_mode"] = False
+        if picked is None:
+            return None, 0
+        refresh_profiles()
+        return picked, 0
+    if explicit_name not in state["profiles"]:
+        print(f"Profile '{explicit_name}' does not exist.", file=sys.stderr)
+        return None, 1
+    return explicit_name, 0
+
+
+def _run_proxy_server_cli(args):
+    if any(a in ("-h", "--help") for a in args):
+        print(proxy.SERVER_USAGE)
+        return 0
+
+    host = None
+    port = proxy.DEFAULT_SERVER_PORT
+    daemon = False
+    positionals = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-d", "--daemon"):
+            daemon = True
+            i += 1
+        elif arg == "--host":
+            if i + 1 >= len(args):
+                print("Error: --host requires an IP address.", file=sys.stderr)
+                return 2
+            host = args[i + 1]
+            i += 2
+        elif arg.startswith("--host="):
+            host = arg.split("=", 1)[1]
+            i += 1
+        elif arg == "--port":
+            if i + 1 >= len(args):
+                print("Error: --port requires a number.", file=sys.stderr)
+                return 2
+            try:
+                port = int(args[i + 1])
+            except ValueError:
+                print(f"Error: invalid port '{args[i + 1]}'.", file=sys.stderr)
+                return 2
+            i += 2
+        elif arg.startswith("--port="):
+            try:
+                port = int(arg.split("=", 1)[1])
+            except ValueError:
+                print(f"Error: invalid port '{arg.split('=', 1)[1]}'.", file=sys.stderr)
+                return 2
+            i += 1
+        elif arg.startswith("-"):
+            print(f"Unknown option: {arg}\n\n{proxy.SERVER_USAGE}", file=sys.stderr)
+            return 2
+        else:
+            positionals.append(arg)
+            i += 1
+
+    if len(positionals) > 1:
+        print(proxy.SERVER_USAGE, file=sys.stderr)
+        return 2
+
+    profile, rc = pick_profile_for_proxy(positionals[0] if positionals else None)
+    if profile is None:
+        return rc
+
+    active = proxy.active_proxies(PROFILES_DIR)
+    if active["server"]:
+        srv = active["server"]
+        print(
+            f"Proxy server is already running (pid {srv['pid']}, profile '{srv['profile']}', "
+            f"http://{srv['host']}:{srv['port']}). Run 'tui-claude proxy stop server' first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not host:
+        try:
+            host = proxy.detect_tailscale_ip()
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+    if daemon:
+        pid, log_path = proxy.spawn_daemon(
+            PROFILES_DIR,
+            "server",
+            ["_proxy-server", profile, host, str(port)],
+            host=host,
+            port=port,
+        )
+        if not pid:
+            print(f"Failed to start proxy server daemon. Check logs at {log_path}", file=sys.stderr)
+            return 1
+        print(
+            f"Proxy server started in background (pid {pid}).\n"
+            f"  Profile:   {profile}\n"
+            f"  Listening: http://{host}:{port}\n"
+            f"  Logs:      {log_path}"
+        )
+        return 0
+
+    return proxy.serve_foreground(PROFILES_DIR, profile, host, port)
+
+
+def _run_proxy_client_cli(args):
+    if not args or any(a in ("-h", "--help") for a in args):
+        print(proxy.CLIENT_USAGE)
+        return 0 if args else 2
+
+    port = proxy.DEFAULT_CLIENT_PORT
+    daemon = False
+    pick = False
+    positionals = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-d", "--daemon"):
+            daemon = True
+            i += 1
+        elif arg == "--pick":
+            pick = True
+            i += 1
+        elif arg == "--port":
+            if i + 1 >= len(args):
+                print("Error: --port requires a number.", file=sys.stderr)
+                return 2
+            try:
+                port = int(args[i + 1])
+            except ValueError:
+                print(f"Error: invalid port '{args[i + 1]}'.", file=sys.stderr)
+                return 2
+            i += 2
+        elif arg.startswith("--port="):
+            try:
+                port = int(arg.split("=", 1)[1])
+            except ValueError:
+                print(f"Error: invalid port '{arg.split('=', 1)[1]}'.", file=sys.stderr)
+                return 2
+            i += 1
+        elif arg.startswith("-"):
+            print(f"Unknown option: {arg}\n\n{proxy.CLIENT_USAGE}", file=sys.stderr)
+            return 2
+        else:
+            positionals.append(arg)
+            i += 1
+
+    if not positionals or len(positionals) > 2:
+        print(proxy.CLIENT_USAGE, file=sys.stderr)
+        return 2
+
+    try:
+        upstream = proxy.normalize_upstream(positionals[0])
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    refresh_profiles()
+    if os.path.lexists(CLAUDE_DIR) and not is_link(CLAUDE_DIR):
+        print(UNMANAGED, file=sys.stderr)
+        return 1
+
+    explicit_profile = positionals[1] if len(positionals) == 2 else None
+    if explicit_profile:
+        if explicit_profile not in state["profiles"]:
+            print(f"Profile '{explicit_profile}' does not exist.", file=sys.stderr)
+            return 1
+        profile = explicit_profile
+    elif pick:
+        profile, rc = pick_profile_for_proxy(None)
+        if profile is None:
+            return rc
+    else:
+        profile = state["active_profile"] or (state["profiles"][0] if state["profiles"] else None)
+        if not profile:
+            print("No profile available.", file=sys.stderr)
+            return 1
+
+    active = proxy.active_proxies(PROFILES_DIR)
+    if active["client"]:
+        cli = active["client"]
+        print(
+            f"Proxy client is already running (pid {cli['pid']}, profile '{cli['profile']}', "
+            f"http://{cli['host']}:{cli['port']} -> {cli['upstream']}). "
+            "Run 'tui-claude proxy stop client' first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    host = proxy.DEFAULT_CLIENT_HOST
+    if daemon:
+        pid, log_path = proxy.spawn_daemon(
+            PROFILES_DIR,
+            "client",
+            ["_proxy-client", profile, upstream, host, str(port)],
+            host=host,
+            port=port,
+        )
+        if not pid:
+            print(f"Failed to start proxy client daemon. Check logs at {log_path}", file=sys.stderr)
+            return 1
+        print(
+            f"Proxy client started in background (pid {pid}).\n"
+            f"  Profile:   {profile} (automatically routed to proxy)\n"
+            f"  Listening: http://{host}:{port} -> {upstream}\n"
+            f"  Logs:      {log_path}\n"
+            f"Run 'tui-claude proxy stop' when done to restore '{profile}'."
+        )
+        return 0
+
+    return proxy.client_foreground(PROFILES_DIR, profile, upstream, host=host, port=port)
+
+
+def run_proxy(args):
+    """Dispatch `tui-claude proxy <subcommand>`."""
+    if not args or args[0] in ("-h", "--help"):
+        print(proxy.PROXY_USAGE)
+        return 0
+
+    sub = args[0]
+    rest = args[1:]
+
+    if sub == "server":
+        return _run_proxy_server_cli(rest)
+    if sub == "client":
+        return _run_proxy_client_cli(rest)
+    if sub == "status":
+        if any(a in ("-h", "--help") for a in rest):
+            print(proxy.STATUS_USAGE)
+            return 0
+        if rest:
+            print(proxy.STATUS_USAGE, file=sys.stderr)
+            return 2
+        refresh_profiles()
+        print(proxy.format_status(PROFILES_DIR))
+        return 0
+    if sub == "stop":
+        if any(a in ("-h", "--help") for a in rest):
+            print(proxy.STOP_USAGE)
+            return 0
+        if len(rest) > 1 or (rest and rest[0] not in ("server", "client", "all")):
+            print(proxy.STOP_USAGE, file=sys.stderr)
+            return 2
+        target = rest[0] if rest else "all"
+        refresh_profiles()
+        stopped = proxy.stop_proxy(PROFILES_DIR, target=target)
+        if not stopped:
+            print("No running proxy processes to stop.")
+        else:
+            for kind, prof, pid in stopped:
+                extra = f" (restored profile '{prof}')" if kind == "client" and prof else f" (profile '{prof}')"
+                print(f"Stopped proxy {kind} (pid {pid}){extra}.")
+        return 0
+    if sub == "logs":
+        if any(a in ("-h", "--help") for a in rest):
+            print(proxy.LOGS_USAGE)
+            return 0
+        kind = "client"
+        lines = 50
+        i = 0
+        while i < len(rest):
+            if rest[i] in ("server", "client"):
+                kind = rest[i]
+                i += 1
+            elif rest[i] == "--lines" and i + 1 < len(rest):
+                try:
+                    lines = int(rest[i + 1])
+                except ValueError:
+                    print(proxy.LOGS_USAGE, file=sys.stderr)
+                    return 2
+                i += 2
+            else:
+                print(proxy.LOGS_USAGE, file=sys.stderr)
+                return 2
+        refresh_profiles()
+        print(proxy.read_logs(PROFILES_DIR, kind, lines=lines), end="")
+        return 0
+
+    print(proxy.PROXY_USAGE, file=sys.stderr)
+    return 2
+
+
 def main(argv=None):
     args = sys.argv[1:] if argv is None else list(argv)
     if not args:
@@ -1024,6 +1349,12 @@ def main(argv=None):
         return run_tmp(args[1] if len(args) == 2 else None)
     if args[0] == "_tmp-exit" and len(args) == 3:
         return tmp_exit(args[1], args[2])
+    if args[0] == "proxy":
+        return run_proxy(args[1:])
+    if args[0] == "_proxy-server" and len(args) == 4:
+        return proxy.serve_foreground(PROFILES_DIR, args[1], args[2], int(args[3]))
+    if args[0] == "_proxy-client" and len(args) == 5:
+        return proxy.client_foreground(PROFILES_DIR, args[1], args[2], host=args[3], port=int(args[4]))
     print(USAGE, file=sys.stderr)
     return 2
 
