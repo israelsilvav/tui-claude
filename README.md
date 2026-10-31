@@ -131,6 +131,41 @@ PS1='${TUI_CLAUDE_PROFILE:+(claude:$TUI_CLAUDE_PROFILE) }'"$PS1"
 > pinned profile in a separate Keychain entry: log in once with `L` inside
 > `tui-claude tmp`.
 
+### Tailscale Proxy (`tui-claude proxy`)
+
+Use an authenticated corporate Claude Code profile from your work machine on your personal computer over Tailscale:
+
+**1. On the work machine (`server`):**
+
+```bash
+# Pick the profile in the TUI (or pass its name directly) and bind to your Tailscale IP:
+tui-claude proxy server work
+
+# Or run in the background as a daemon (-d):
+tui-claude proxy server work --host 100.78.40.97 --port 8888 -d
+```
+
+If `--host` is omitted, `tui-claude` detects your Tailscale IPv4 automatically via `tailscale ip -4`. It reads `.credentials.json` directly from `~/.claude-profiles/<profile>/` and pins the profile while running.
+
+**2. On the personal computer (`client`):**
+
+```bash
+# Forward local requests to the work machine and auto-configure the active profile:
+tui-claude proxy client 100.78.40.97
+
+# Or specify a target profile and run in the background (-d):
+tui-claude proxy client 100.78.40.97 work -d
+```
+
+While the client proxy is running, `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` are automatically injected into the target profile's `settings.json` (without polluting the `_shared` pool). When you stop the proxy (`Ctrl+C` or `tui-claude proxy stop`), the profile's original `settings.json` is automatically restored.
+
+```bash
+tui-claude proxy status          # check running server/client daemons
+tui-claude proxy logs client     # inspect recent daemon logs
+tui-claude proxy stop            # stop daemons and restore the profile
+tui-claude proxy --help          # see all proxy commands and options
+```
+
 ## How it works
 
 Claude Code always reads from two fixed paths. `tui-claude` points them at the profile you selected:
@@ -265,8 +300,10 @@ That environment variable relocates all three paths (`~/.claude`, `~/.claude.jso
 | `src/tui_claude/main.py` | TUI: state, key bindings, rendering, profile operations |
 | `src/tui_claude/sharing.py` | Shared pool: merge, fork, repair, `claude.json` split/rebuild |
 | `src/tui_claude/tmp_mode.py` | tmp mode: the `.claude.json` link, pinned terminals, the shell's exec |
+| `src/tui_claude/proxy.py` | Tailscale proxy server/client, daemon management, automatic profile lifecycle |
 | `tests/test_sharing.py` | Pool semantics, identity isolation, repair, locking |
 | `tests/test_tui_integration.py` | TUI flows and rendering against a sandbox |
 | `tests/test_tmp_mode.py` | tmp mode, including an end-to-end run of the real exec |
+| `tests/test_proxy.py` | Proxy server/client streaming, token extraction, automatic profile lifecycle |
 
 `sharing.py` has no dependency on `prompt_toolkit`, and the interactive dialogues take their input and output functions as arguments — so every behaviour is reachable from tests without a terminal.
